@@ -27,6 +27,8 @@
 #include "utils/rel.h"
 #include "parser/parsetree.h"
 #include "fmgr.h"
+#include "executor/spi.h"
+#include "nodes/print.h"
 
 
 PG_MODULE_MAGIC;
@@ -498,6 +500,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	MulticornExecState *execstate;
 	TupleDesc	tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
 	ListCell   *lc;
+	MemoryContext context;
 
 	execstate = initializeExecState(fscan->fdw_private);
 	execstate->values = palloc(sizeof(Datum) * tupdesc->natts);
@@ -511,56 +514,231 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	}
 	initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(tupdesc));
 	node->fdw_state = execstate;
+
+	/*
+	* There's a nasty interplay of memory contexts here between the SPI and the 
+	* foreign scan executor because we "hold" an SPI connection throughout the 
+	* lifetime of the foreign scan.
+	* 
+	* We're currently in the ForeignScan node's memory context but SPI_connect
+	* will switch it to a new context which will get destroyed at the end 
+	* of the scan when we call SPI_finish. This means that anything the 
+	* foreign scan node allocates will be deallocated by the SPI rather than 
+	* the scan, causing a crash at the end of the scan after the SPI context 
+	* is destroyed.
+	* 
+	* We don't actually need to hold on to the SPI context, the SPI switches
+	* to it when needed/allocates memory there.
+	*/
+	
+	context = CurrentMemoryContext;
+	SPI_connect();
+	MemoryContextSwitchTo(context);
+}
+
+/* 
+ * Debug functions to print TupleDesc structs (stolen from private PG),
+ * not currently used anywhere.
+ */
+static void
+printatt(unsigned attributeId,
+		Form_pg_attribute attributeP)
+{
+	printf("\t%2d: %s\t(typeid = %u, len = %d, typmod = %d, byval = %c)\n",
+			attributeId,
+			NameStr(attributeP->attname),
+			(unsigned int) (attributeP->atttypid),
+			attributeP->attlen,
+			attributeP->atttypmod,
+			attributeP->attbyval ? 't' : 'f');
+}
+
+static void print_desc(TupleDesc desc)
+{
+	int         i;
+	for (i = 0; i < desc->natts; ++i)
+	{ 
+		printatt((unsigned) i + 1, TupleDescAttr(desc, i));
+	}
 }
 
 
 /*
- * multicornIterateForeignScan
- *		Retrieve next row from the result set, or clear tuple slot to indicate
- *		EOF.
- *
- *		This is done by iterating over the result from the "execute" python
- *		method.
- */
+* multicornIterateForeignScan
+*		Retrieve next row from the result set, or clear tuple slot to indicate
+*		EOF.
+*
+*		This is done by iterating over the result from the "execute" python
+*		method.
+*/
 static TupleTableSlot *
 multicornIterateForeignScan(ForeignScanState *node)
 {
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	MulticornExecState *execstate = node->fdw_state;
 	PyObject   *p_value;
-
-	if (execstate->p_iterator == NULL)
-	{
-		execute(node, NULL);
-	}
+	
+	/* The data flow here is kind of complex: we treat strings returned by 
+	 * Python as fully mogrified SELECT queries to read data from directly 
+	 * instead of getting Python to return it to us. To execute those queries, 
+	 * we use the Postgres SPI which gives us back a Portal (cursor). But we 
+	 * also consume tuples from the cursor in batches: they're stored in a 
+	 * global variable SPI_tuptable and we're only supposed to return one tuple
+	 * (injected into our TupleTableSlot) per invocation. So we have to manage 
+	 * between requesting the next Python object from the iterator, requesting 
+	 * the next Portal, requesting the next TupleTableSlot and emitting single 
+	 * tuples.
+	 * 
+	 * We perform these in an infinite loop forming a kind of a state machine, 
+	 * which works around edge cases like "next SELECT query returned by Python 
+	 * actually doesn't return anything".
+	 */
+	
 	ExecClearTuple(slot);
-	if (execstate->p_iterator == Py_None)
+	while (1)
 	{
-		/* No iterator returned from get_iterator */
-		Py_DECREF(execstate->p_iterator);
-		return slot;
-	}
-	p_value = PyIter_Next(execstate->p_iterator);
-	errorCheck();
-	/* A none value results in an empty slot. */
-	if (p_value == NULL || p_value == Py_None)
-	{
-		Py_XDECREF(p_value);
-		return slot;
-	}
-	slot->tts_values = execstate->values;
-	slot->tts_isnull = execstate->nulls;
-	pythonResultToTuple(p_value, slot, execstate->cinfos, execstate->buffer);
-	ExecStoreVirtualTuple(slot);
-	Py_DECREF(p_value);
+		if (execstate->cursor != NULL && execstate->spi_tuptable_read < SPI_processed)
+		{
+			/* We have a cursor and the global SPI_tuptable isn't exhausted.
+			 * 
+			 * Here, the SPI tuple was created in the SPI context and normally
+			 * we're advised to use SPI_copytuple to copy it into whatever the 
+			 * context was before SPI_connect was called (so that the tuple 
+			 * doesn't get deleted during SPI_finish). However, in this case 
+			 * the context iterateForeignScan runs in is short-lived: the 
+			 * executor extracts the tuple from the context itself after running
+			 * projections/filters on it.
+			 * 
+			 * This means we can keep the tuple in the SPI context, since it's 
+			 * going to live longer than our context anyway.
+			 */
+			
+			HeapTuple tuple = SPI_tuptable->vals[execstate->spi_tuptable_read++];
+			/* elog(WARNING, "Got a tuple from SPI at %p", tuple);
+			* 
+			* NB we don't actually check that the TupleDesc returned by the
+			* query matches the required one: if there's a type/length
+			* mismatch, we'll likely just crash. The following statement
+			* would have been useful but it returns False even for compatible
+			* TupleDescs. 
+			* 
+			* if (!equalTupleDescs(SPI_tuptable->tupdesc, slot->tts_tupleDescriptor))
+			* {
+			*      elog(WARNING, "tuptable tupdesc different from ours");
+			* }
+			*/
+			
+			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+			return slot;
+		}
+		
+		if (execstate->cursor != NULL)
+		{
+			if (SPI_tuptable)
+			{
+				SPI_freetuptable(SPI_tuptable);
+			}
+			/* Fetch next N rows (implicitly into global SPI_tuptable) and 
+			 * reset our read position.
+			 */
+			SPI_cursor_fetch(execstate->cursor, true, 100000);
+			execstate->spi_tuptable_read = 0;
+			// elog(INFO, "Fetched %d row(s), SPI status %d", SPI_processed, SPI_result);
+			
+			if (SPI_processed == 0)
+			{
+				/* If we've exhausted the cursor, close it and set it to NULL.
+				 * The next block of code will try to get the next item from 
+				 * the Python iterator.
+				 */
+				SPI_cursor_close(execstate->cursor);
+				execstate->cursor = NULL;
+			}
+			else
+			{
+				// If there's stuff in the cursor, read it
+				continue;
+			}
+		}
+		
+		// Get the next item from the iterator
+		if (execstate->p_iterator == NULL)
+		{
+			execute(node, NULL);
+		}
+		if (execstate->p_iterator == Py_None)
+		{
+			/* No iterator returned from get_iterator */
+			Py_DECREF(execstate->p_iterator);
+			return slot;
+		}
+		p_value = PyIter_Next(execstate->p_iterator);
+		errorCheck();
+		/* A none value results in an empty slot. */
+		if (p_value == NULL || p_value == Py_None)
+		{
+			Py_XDECREF(p_value);
+			return slot;
+		}
 
-	return slot;
+		if (PyBytes_Check(p_value))
+		{
+			/* If the iterator is a Bytes object, treat it as a fully mogrified 
+			 * SELECT query that talks to  a Postgres table.
+			 */
+			SPIPlanPtr plan;
+			Portal     cursor;
+			
+			// Extract the query and open a Portal (cursor).
+			char	   *statement;
+			Py_ssize_t	strlength = 0;
+			
+			if (PyString_AsStringAndSize(p_value, &statement, &strlength) < 0)
+			{
+				elog(ERROR, "Could not convert subquery to string!");
+			}
+			
+			/* Prepare a plan (no arguments) and open a Portal 
+			 * (random name, no arguments, no nulls, read-only)
+			 */
+			
+			plan = SPI_prepare(statement, 0, NULL);
+			if (SPI_result != 0)
+			{
+				elog(WARNING, "Error preparing query plan for %s, status %d", 
+					 statement, SPI_result);
+			}
+			
+			cursor = SPI_cursor_open(NULL, plan, NULL, NULL, true);
+			if (SPI_result != 0)
+			{
+				elog(WARNING, "Error opening cursor for %s, status %d", 
+					 statement, SPI_result);
+			}
+			
+			/* Continue without doing anything else (like trying to read from 
+			 * the cursor), the next iteration will pick that up.
+			 */
+			execstate->cursor = cursor;
+			Py_DECREF(p_value);
+		}
+		else
+		{
+			slot->tts_values = execstate->values;
+			slot->tts_isnull = execstate->nulls;
+			pythonResultToTuple(p_value, slot, execstate->cinfos, execstate->buffer);
+			ExecStoreVirtualTuple(slot);
+			Py_DECREF(p_value);
+			return slot;
+
+		}
+	}
 }
 
 /*
- * multicornReScanForeignScan
- *		Restart the scan
- */
+* multicornReScanForeignScan
+*		Restart the scan
+*/
 static void
 multicornReScanForeignScan(ForeignScanState *node)
 {
@@ -571,12 +749,25 @@ multicornReScanForeignScan(ForeignScanState *node)
 		Py_DECREF(state->p_iterator);
 		state->p_iterator = NULL;
 	}
+	
+	if (state->cursor)
+	{
+		SPI_cursor_close(state->cursor);
+		state->cursor = NULL;
+	}
+
+	if (SPI_tuptable)
+	{
+		SPI_freetuptable(SPI_tuptable);
+	}
+	
+	state->spi_tuptable_read = 0;
 }
 
 /*
- *	multicornEndForeignScan
- *		Finish scanning foreign table and dispose objects used for this scan.
- */
+*	multicornEndForeignScan
+*		Finish scanning foreign table and dispose objects used for this scan.
+*/
 static void
 multicornEndForeignScan(ForeignScanState *node)
 {
@@ -588,23 +779,39 @@ multicornEndForeignScan(ForeignScanState *node)
 	Py_DECREF(state->fdw_instance);
 	Py_XDECREF(state->p_iterator);
 	state->p_iterator = NULL;
+
+	if (state->cursor)
+	{
+		SPI_cursor_close(state->cursor);
+		state->cursor = NULL;
+	}
+
+	if (SPI_tuptable)
+	{
+		SPI_freetuptable(SPI_tuptable);
+	}
+	
+	state->spi_tuptable_read = 0;
+	
+	if (SPI_finish() != SPI_OK_FINISH)
+		elog(WARNING, "SPI_finish failed");
 }
 
 
 
 #if PG_VERSION_NUM >= 90300
 /*
- * multicornAddForeigUpdateTargets
- *		Add resjunk columns needed for update/delete.
- */
+* multicornAddForeigUpdateTargets
+*		Add resjunk columns needed for update/delete.
+*/
 static void
 multicornAddForeignUpdateTargets(Query *parsetree,
-								 RangeTblEntry *target_rte,
-								 Relation target_relation)
+								RangeTblEntry *target_rte,
+								Relation target_relation)
 {
 	Var		   *var = NULL;
 	TargetEntry *tle,
-			   *returningTle;
+			*returningTle;
 	PyObject   *instance = getInstance(target_relation->rd_id);
 	const char *attrname = getRowIdColumn(instance);
 	TupleDesc	desc = target_relation->rd_att;
@@ -1060,5 +1267,7 @@ initializeExecState(void *internalstate)
 	execstate->cinfos = palloc0(sizeof(ConversionInfo *) * attnum);
 	execstate->values = palloc(attnum * sizeof(Datum));
 	execstate->nulls = palloc(attnum * sizeof(bool));
+	execstate->spi_tuptable_read = 0;
+	execstate->cursor = NULL;
 	return execstate;
 }

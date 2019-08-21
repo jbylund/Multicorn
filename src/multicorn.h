@@ -19,6 +19,7 @@
 #endif
 #include "utils/builtins.h"
 #include "utils/syscache.h"
+#include "utils/portal.h"
 
 #ifndef PG_MULTICORN_H
 #define PG_MULTICORN_H
@@ -96,6 +97,9 @@ typedef struct MulticornExecState
 	AttrNumber	rowidAttno;
 	char	   *rowidAttrName;
 	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
+	/* Information related to executing subqueries */
+	int         spi_tuptable_read;
+	Portal      cursor;
 }	MulticornExecState;
 
 typedef struct MulticornModifyState

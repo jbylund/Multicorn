@@ -28,7 +28,7 @@ void		getColumnsFromTable(TupleDesc desc, PyObject **p_columns, List **columns);
 bool		compareColumns(List *columns1, List *columns2);
 
 PyObject   *getClass(PyObject *className);
-PyObject   *valuesToPySet(List *targetlist);
+PyObject   *valuesToPyList(List *targetlist);
 PyObject   *qualDefsToPyList(List *quallist, ConversionInfo ** cinfo);
 PyObject *pythonQual(char *operatorname, PyObject *value,
 		   ConversionInfo * cinfo,
@@ -250,12 +250,12 @@ appendBinaryStringInfoQuote(StringInfo buffer,
 
 /*
  * Convert a list of Value nodes containing the column name as a string to a
- * pyset of python unicode strings.
+ * pylist of python unicode strings.
  */
 PyObject *
-valuesToPySet(List *targetlist)
+valuesToPyList(List *targetlist)
 {
-	PyObject   *result = PySet_New(0);
+	PyObject   *result = PyList_New(0);
 	ListCell   *lc;
 
 	foreach(lc, targetlist)
@@ -263,7 +263,7 @@ valuesToPySet(List *targetlist)
 		Value	   *value = (Value *) lfirst(lc);
 		PyObject   *pyString = PyString_FromString(strVal(value));
 
-		PySet_Add(result, pyString);
+		PyList_Append(result, pyString);
 		Py_DECREF(pyString);
 	}
 	return result;
@@ -713,7 +713,7 @@ getRelSize(MulticornPlanState * state,
 			   *p_width,
 			   *p_startup_cost;
 
-	p_targets_set = valuesToPySet(state->target_list);
+	p_targets_set = valuesToPyList(state->target_list);
 	p_quals = qualDefsToPyList(state->qual_list, state->cinfos);
 	p_rows_and_width = PyObject_CallMethod(state->fdw_instance, "get_rel_size",
 										   "(O,O)", p_quals, p_targets_set);
@@ -954,7 +954,7 @@ execute(ForeignScanState *node, ExplainState *es)
 		}
 	}
 	/* Transform every object to a suitable python representation */
-	p_targets_set = valuesToPySet(state->target_list);
+	p_targets_set = valuesToPyList(state->target_list);
 
 	foreach(lc, state->pathkeys)
 	{
