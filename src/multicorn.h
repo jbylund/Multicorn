@@ -98,8 +98,13 @@ typedef struct MulticornExecState
 	char	   *rowidAttrName;
 	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
 	/* Information related to executing subqueries */
-	int         spi_tuptable_read;
-	Portal      cursor;
+	MemoryContext  subquery_cxt; 
+	Portal         cursor;
+	DestReceiver  *receiver;
+	HeapTuple     *tuples;
+	int            num_tuples;
+	int            next_tuple;
+	int            max_tuples;
 }	MulticornExecState;
 
 typedef struct MulticornModifyState

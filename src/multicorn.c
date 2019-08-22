@@ -29,6 +29,7 @@
 #include "fmgr.h"
 #include "executor/spi.h"
 #include "nodes/print.h"
+#include "tcop/pquery.h"
 
 
 PG_MODULE_MAGIC;
@@ -111,6 +112,8 @@ MulticornExecState *initializeExecState(void *internal_plan_state);
 
 /* Hash table mapping oid to fdw instances */
 HTAB	   *InstancesHash;
+
+DestReceiver *CreateMulticornDestReceiver(MulticornExecState *execstate);
 
 
 void
@@ -487,6 +490,65 @@ multicornExplainForeignScan(ForeignScanState *node, ExplainState *es)
 }
 
 /*
+ * Receiver for Portal fetches that writes tuples into MulticornExecState
+ */
+
+typedef struct
+{
+	DestReceiver pub;
+	MulticornExecState *execstate;
+} DR_multicorn;
+
+static void
+dr_multicorn_startup(DestReceiver *self, int operation, TupleDesc typeinfo) {}
+
+/*
+ * receive one tuple
+ */
+static bool
+dr_multicorn_receive(TupleTableSlot *slot, DestReceiver *self)
+{
+	MulticornExecState *state = ((DR_multicorn *) self)->execstate;
+	
+	if (state->num_tuples >= state->max_tuples)
+	{
+		// This shouldn't happen, as we explicltly fetched max_tuples
+		// tuples from the cursor. But just in case, we ignore tuples
+		// that we don't have space for in the buffer.
+		elog(WARNING, "DR_multicorn receive: over capacity!");
+		return false;
+	}
+	
+	state->tuples[state->num_tuples++] = ExecCopySlotTuple(slot);
+
+	return true;
+}
+
+static void
+dr_multicorn_shutdown(DestReceiver *self) { }
+
+static void
+dr_multicorn_destroy(DestReceiver *self)
+{
+	pfree(self);
+}
+
+DestReceiver *
+CreateMulticornDestReceiver(MulticornExecState *execstate)
+{
+	DR_multicorn *self = (DR_multicorn *) palloc0(sizeof(DR_multicorn));
+
+	self->pub.receiveSlot = dr_multicorn_receive;
+	self->pub.rStartup = dr_multicorn_startup;
+	self->pub.rShutdown = dr_multicorn_shutdown;
+	self->pub.rDestroy = dr_multicorn_destroy;
+	self->execstate = execstate;
+
+	return (DestReceiver *) self;
+}
+
+
+/*
  *	multicornBeginForeignScan
  *		Initialize the foreign scan.
  *		This (primarily) involves :
@@ -500,7 +562,6 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	MulticornExecState *execstate;
 	TupleDesc	tupdesc = RelationGetDescr(node->ss.ss_currentRelation);
 	ListCell   *lc;
-	MemoryContext context;
 
 	execstate = initializeExecState(fscan->fdw_private);
 	execstate->values = palloc(sizeof(Datum) * tupdesc->natts);
@@ -513,27 +574,16 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 							&execstate->qual_list);
 	}
 	initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(tupdesc));
-	node->fdw_state = execstate;
-
-	/*
-	* There's a nasty interplay of memory contexts here between the SPI and the 
-	* foreign scan executor because we "hold" an SPI connection throughout the 
-	* lifetime of the foreign scan.
-	* 
-	* We're currently in the ForeignScan node's memory context but SPI_connect
-	* will switch it to a new context which will get destroyed at the end 
-	* of the scan when we call SPI_finish. This means that anything the 
-	* foreign scan node allocates will be deallocated by the SPI rather than 
-	* the scan, causing a crash at the end of the scan after the SPI context 
-	* is destroyed.
-	* 
-	* We don't actually need to hold on to the SPI context, the SPI switches
-	* to it when needed/allocates memory there.
-	*/
 	
-	context = CurrentMemoryContext;
-	SPI_connect();
-	MemoryContextSwitchTo(context);
+	// Create a receiver for tuples we fetch from the subquery
+	execstate->receiver = CreateMulticornDestReceiver(execstate);
+	
+	execstate->subquery_cxt = AllocSetContextCreate(
+		node->ss.ps.state->es_query_cxt,
+		"Multicorn tuple data",
+		ALLOCSET_DEFAULT_SIZES);
+	
+	node->fdw_state = execstate;
 }
 
 /* 
@@ -582,8 +632,8 @@ multicornIterateForeignScan(ForeignScanState *node)
 	 * Python as fully mogrified SELECT queries to read data from directly 
 	 * instead of getting Python to return it to us. To execute those queries, 
 	 * we use the Postgres SPI which gives us back a Portal (cursor). But we 
-	 * also consume tuples from the cursor in batches: they're stored in a 
-	 * global variable SPI_tuptable and we're only supposed to return one tuple
+	 * also consume tuples from the cursor in batches: they're stored in an
+	 * array in our state (tuples) and we're only supposed to return one tuple
 	 * (injected into our TupleTableSlot) per invocation. So we have to manage 
 	 * between requesting the next Python object from the iterator, requesting 
 	 * the next Portal, requesting the next TupleTableSlot and emitting single 
@@ -597,25 +647,12 @@ multicornIterateForeignScan(ForeignScanState *node)
 	ExecClearTuple(slot);
 	while (1)
 	{
-		if (execstate->cursor != NULL && execstate->spi_tuptable_read < SPI_processed)
+		if (execstate->cursor != NULL && execstate->next_tuple < execstate->num_tuples)
 		{
-			/* We have a cursor and the global SPI_tuptable isn't exhausted.
-			 * 
-			 * Here, the SPI tuple was created in the SPI context and normally
-			 * we're advised to use SPI_copytuple to copy it into whatever the 
-			 * context was before SPI_connect was called (so that the tuple 
-			 * doesn't get deleted during SPI_finish). However, in this case 
-			 * the context iterateForeignScan runs in is short-lived: the 
-			 * executor extracts the tuple from the context itself after running
-			 * projections/filters on it.
-			 * 
-			 * This means we can keep the tuple in the SPI context, since it's 
-			 * going to live longer than our context anyway.
-			 */
+			// We have a cursor and our tuple table isn't exhausted.
 			
-			HeapTuple tuple = SPI_tuptable->vals[execstate->spi_tuptable_read++];
-			/* elog(WARNING, "Got a tuple from SPI at %p", tuple);
-			* 
+			HeapTuple tuple = execstate->tuples[execstate->next_tuple++];
+			/* 
 			* NB we don't actually check that the TupleDesc returned by the
 			* query matches the required one: if there's a type/length
 			* mismatch, we'll likely just crash. The following statement
@@ -634,24 +671,34 @@ multicornIterateForeignScan(ForeignScanState *node)
 		
 		if (execstate->cursor != NULL)
 		{
-			if (SPI_tuptable)
-			{
-				SPI_freetuptable(SPI_tuptable);
-			}
-			/* Fetch next N rows (implicitly into global SPI_tuptable) and 
-			 * reset our read position.
-			 */
-			SPI_cursor_fetch(execstate->cursor, true, 100000);
-			execstate->spi_tuptable_read = 0;
-			// elog(INFO, "Fetched %d row(s), SPI status %d", SPI_processed, SPI_result);
+			MemoryContext oldcontext;
+
+			// Flush the previous batch of tuple and allocate a new one.
+			execstate->tuples = NULL;
+			MemoryContextReset(execstate->subquery_cxt);
+			oldcontext = MemoryContextSwitchTo(execstate->subquery_cxt);
 			
-			if (SPI_processed == 0)
+			execstate->max_tuples = 10000;
+			execstate->tuples = (HeapTuple *) palloc0(execstate->max_tuples * sizeof(HeapTuple));
+			execstate->next_tuple = 0;
+			
+			execstate->num_tuples = 
+				PortalRunFetch(execstate->cursor, FETCH_FORWARD,
+							   execstate->max_tuples, execstate->receiver);
+			// elog(WARNING, "Fetched %d row(s)", execstate->num_tuples);
+			
+			// Reset the position in the tuples array
+			execstate->next_tuple = 0;
+			MemoryContextSwitchTo(oldcontext);
+			
+			if (execstate->num_tuples == 0)
 			{
 				/* If we've exhausted the cursor, close it and set it to NULL.
 				 * The next block of code will try to get the next item from 
 				 * the Python iterator.
 				 */
-				SPI_cursor_close(execstate->cursor);
+				
+				PortalDrop(execstate->cursor, false);
 				execstate->cursor = NULL;
 			}
 			else
@@ -687,7 +734,6 @@ multicornIterateForeignScan(ForeignScanState *node)
 			 * SELECT query that talks to  a Postgres table.
 			 */
 			SPIPlanPtr plan;
-			Portal     cursor;
 			
 			// Extract the query and open a Portal (cursor).
 			char	   *statement;
@@ -699,27 +745,42 @@ multicornIterateForeignScan(ForeignScanState *node)
 			}
 			
 			/* Prepare a plan (no arguments) and open a Portal 
-			 * (random name, no arguments, no nulls, read-only)
-			 */
+			 * (random name, no arguments, no nulls, read-write).
+			 * 
+			 * Seems like we need a read-write Portal because otherwise
+			 * we see a snapshot from before this query began: if the Python
+			 * process created a temporary table to write data into, we won't
+			 * see any data in the table in read-only mode.
+			 * 
+			 * Here, we use the SPI to do the legwork of preparing a Portal
+			 * for us. We can't really use the SPI to scan through the
+			 * actual portal as we're not supposed to leave the function
+			 * that the SPI "connection" is open in: if we return a tuple
+			 * from here and then another Multicorn plan is executed which
+			 * also calls SPI_connect, the two SPI "contexts" will conflict
+			 * with each other, leading to bizarre bugs and crashes.
+			 */ 
 			
+			SPI_connect();
+			// elog(WARNING, "Running query %s", statement);
 			plan = SPI_prepare(statement, 0, NULL);
 			if (SPI_result != 0)
 			{
 				elog(WARNING, "Error preparing query plan for %s, status %d", 
 					 statement, SPI_result);
 			}
-			
-			cursor = SPI_cursor_open(NULL, plan, NULL, NULL, true);
+						
+			execstate->cursor = SPI_cursor_open(NULL, plan, NULL, NULL, true);
 			if (SPI_result != 0)
 			{
 				elog(WARNING, "Error opening cursor for %s, status %d", 
 					 statement, SPI_result);
 			}
 			
+			SPI_finish();
 			/* Continue without doing anything else (like trying to read from 
 			 * the cursor), the next iteration will pick that up.
 			 */
-			execstate->cursor = cursor;
 			Py_DECREF(p_value);
 		}
 		else
@@ -730,8 +791,8 @@ multicornIterateForeignScan(ForeignScanState *node)
 			ExecStoreVirtualTuple(slot);
 			Py_DECREF(p_value);
 			return slot;
-
 		}
+
 	}
 }
 
@@ -752,16 +813,13 @@ multicornReScanForeignScan(ForeignScanState *node)
 	
 	if (state->cursor)
 	{
-		SPI_cursor_close(state->cursor);
+		PortalDrop(state->cursor, false);
 		state->cursor = NULL;
 	}
-
-	if (SPI_tuptable)
-	{
-		SPI_freetuptable(SPI_tuptable);
-	}
 	
-	state->spi_tuptable_read = 0;
+	state->next_tuple = 0;
+	state->max_tuples = 0;
+	state->num_tuples = 0;
 }
 
 /*
@@ -782,19 +840,16 @@ multicornEndForeignScan(ForeignScanState *node)
 
 	if (state->cursor)
 	{
-		SPI_cursor_close(state->cursor);
+		PortalDrop(state->cursor, false);
 		state->cursor = NULL;
 	}
-
-	if (SPI_tuptable)
+	
+	if (state->receiver)
 	{
-		SPI_freetuptable(SPI_tuptable);
+		state->receiver->rDestroy(state->receiver);
 	}
 	
-	state->spi_tuptable_read = 0;
-	
-	if (SPI_finish() != SPI_OK_FINISH)
-		elog(WARNING, "SPI_finish failed");
+	/* MemoryContexts will be deleted automatically. */
 }
 
 
@@ -1267,7 +1322,6 @@ initializeExecState(void *internalstate)
 	execstate->cinfos = palloc0(sizeof(ConversionInfo *) * attnum);
 	execstate->values = palloc(attnum * sizeof(Datum));
 	execstate->nulls = palloc(attnum * sizeof(bool));
-	execstate->spi_tuptable_read = 0;
 	execstate->cursor = NULL;
 	return execstate;
 }
