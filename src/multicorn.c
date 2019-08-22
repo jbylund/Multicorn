@@ -510,7 +510,7 @@ dr_multicorn_receive(TupleTableSlot *slot, DestReceiver *self)
 {
 	MulticornExecState *state = ((DR_multicorn *) self)->execstate;
 	
-	if (state->num_tuples >= state->max_tuples)
+	if (state->next_tuple >= state->max_tuples)
 	{
 		// This shouldn't happen, as we explicltly fetched max_tuples
 		// tuples from the cursor. But just in case, we ignore tuples
@@ -519,7 +519,7 @@ dr_multicorn_receive(TupleTableSlot *slot, DestReceiver *self)
 		return false;
 	}
 	
-	state->tuples[state->num_tuples++] = ExecCopySlotTuple(slot);
+	state->tuples[state->next_tuple++] = ExecCopySlotTuple(slot);
 
 	return true;
 }
@@ -770,7 +770,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 					 statement, SPI_result);
 			}
 						
-			execstate->cursor = SPI_cursor_open(NULL, plan, NULL, NULL, true);
+			execstate->cursor = SPI_cursor_open(NULL, plan, NULL, NULL, false);
 			if (SPI_result != 0)
 			{
 				elog(WARNING, "Error opening cursor for %s, status %d", 
