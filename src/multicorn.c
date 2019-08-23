@@ -115,6 +115,14 @@ HTAB	   *InstancesHash;
 
 DestReceiver *CreateMulticornDestReceiver(MulticornExecState *execstate);
 
+#ifdef DEBUG
+#define DEBUG_TEST 1
+#else
+#define DEBUG_TEST 0
+#endif
+#define debug_elog(fmt, ...) \
+	do { if (DEBUG_TEST) elog(WARNING, fmt, ##__VA_ARGS__); } while (0)
+
 
 void
 _PG_init()
@@ -661,7 +669,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 			* 
 			* if (!equalTupleDescs(SPI_tuptable->tupdesc, slot->tts_tupleDescriptor))
 			* {
-			*      elog(WARNING, "tuptable tupdesc different from ours");
+			*      debug_elog("tuptable tupdesc different from ours");
 			* }
 			*/
 			
@@ -685,7 +693,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 			execstate->num_tuples = 
 				PortalRunFetch(execstate->cursor, FETCH_FORWARD,
 							   execstate->max_tuples, execstate->receiver);
-			// elog(WARNING, "Fetched %d row(s)", execstate->num_tuples);
+			debug_elog("Fetched %d row(s)", execstate->num_tuples);
 			
 			// Reset the position in the tuples array
 			execstate->next_tuple = 0;
@@ -762,7 +770,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 			 */ 
 			
 			SPI_connect();
-			// elog(WARNING, "Running query %s", statement);
+			debug_elog("Running query %s", statement);
 			plan = SPI_prepare(statement, 0, NULL);
 			if (SPI_result != 0)
 			{
@@ -777,6 +785,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 					 statement, SPI_result);
 			}
 			
+			debug_elog("Portal opened, exiting SPI");
 			SPI_finish();
 			/* Continue without doing anything else (like trying to read from 
 			 * the cursor), the next iteration will pick that up.
