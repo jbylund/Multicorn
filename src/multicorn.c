@@ -635,6 +635,9 @@ multicornIterateForeignScan(ForeignScanState *node)
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	MulticornExecState *execstate = node->fdw_state;
 	PyObject   *p_value;
+	bool		isnull;
+	Datum		datum;
+	ListCell	*lc;
 	
 	/* The data flow here is kind of complex: we treat strings returned by 
 	 * Python as fully mogrified SELECT queries to read data from directly 
@@ -666,14 +669,66 @@ multicornIterateForeignScan(ForeignScanState *node)
 			* mismatch, we'll likely just crash. The following statement
 			* would have been useful but it returns False even for compatible
 			* TupleDescs. 
-			* 
-			* if (!equalTupleDescs(SPI_tuptable->tupdesc, slot->tts_tupleDescriptor))
-			* {
-			*      debug_elog("tuptable tupdesc different from ours");
-			* }
 			*/
 			
-			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+			// Insert the new tuple into the slot. We can't use ExecStoreTuple
+			// here, as the tuple we got back from Python has the same shape
+			// and types as what we requested from it (hopefully) whereas
+			// the slot that Postgres gave us can be as wide as the table
+			// itself (we're supposed to fill in the relevant values).
+
+			int i = 0;
+			int j = 1;
+			
+			foreach(lc, execstate->target_list)
+			{
+				Value *value = (Value *) lfirst(lc);
+				
+				// Find the actual position in the TupleTableSlot that
+				// we're supposed to fill in.
+				// Here we assume that the attributes appear in the same order
+				// in the target_list as they do in the tuple descriptor.
+				
+				while (strcmp(NameStr(slot->tts_tupleDescriptor->attrs[i].attname),
+					strVal(value)))
+				{
+					slot->tts_values[i] = 0;
+					slot->tts_isnull[i] = true;
+					i++;
+					
+				}
+				debug_elog("Inserting column %d (%s) into position %d", j, strVal(value), i);
+				
+				datum = heap_getattr(tuple, j, slot->tts_tupleDescriptor, &isnull);
+				
+				if (isnull)
+				{
+					slot->tts_values[i] = 0;
+					slot->tts_isnull[i] = true;
+				}
+				else {
+					slot->tts_values[i] = datum;
+					slot->tts_isnull[i] = false;
+				}
+				j++;
+				i++;
+			}
+
+			// Fill out the remaining slot items with NULLs (not doing this
+			// crashes the query).
+			for (; i<slot->tts_tupleDescriptor->natts; i++)
+			{
+				slot->tts_values[i] = 0;
+				slot->tts_isnull[i] = true;
+			}
+
+			ExecStoreVirtualTuple(slot);
+			
+#ifdef DEBUG
+			print_desc(slot->tts_tupleDescriptor);
+			print_slot(slot);
+			fflush(stdout);
+#endif
 			return slot;
 		}
 		
