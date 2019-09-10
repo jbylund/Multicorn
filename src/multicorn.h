@@ -70,6 +70,8 @@ typedef struct MulticornPlanState
 	int			startupCost;
 	ConversionInfo **cinfos;
 	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
+	int		   *target_map; // map of (position in target_list ->
+							//         position in relation's TupleDesc)
 
 	/* For some reason, `baserel->reltarget->width` gets changed
 	 * outside of our control somewhere between GetForeignPaths and
@@ -92,6 +94,7 @@ typedef struct MulticornExecState
 	Datum	   *values;
 	bool	   *nulls;
 	ConversionInfo **cinfos;
+	int		   *target_map;
 	/* Common buffer to avoid repeated allocations */
 	StringInfo	buffer;
 	AttrNumber	rowidAttno;

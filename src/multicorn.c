@@ -321,6 +321,26 @@ multicornGetForeignRelSize(PlannerInfo *root,
 			}
 		}
 	}
+	
+	planstate->target_map = palloc0(sizeof(int) * list_length(planstate->target_list));
+	int j = 0;
+	foreach(lc, planstate->target_list)
+	{
+		// Find out the position in the tuple table slot that this
+		// column matches.
+		for (int i = 0; i < desc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, i);
+
+			if (!att->attisdropped && 
+				strcmp(NameStr(att->attname), strVal(lfirst(lc))) == 0)
+			{
+				debug_elog("Target map: %d -> %d", j, i);
+				planstate->target_map[j++] = i;
+			}
+		}
+	}
+	
 	/* Extract the restrictions from the plan. */
 	foreach(lc, baserel->baserestrictinfo)
 	{
@@ -676,52 +696,36 @@ multicornIterateForeignScan(ForeignScanState *node)
 			// and types as what we requested from it (hopefully) whereas
 			// the slot that Postgres gave us can be as wide as the table
 			// itself (we're supposed to fill in the relevant values).
+			
+			// Clear out the slot and fill it with NULLs.
+			for (int i = 0; i<slot->tts_tupleDescriptor->natts; i++)
+			{
+				slot->tts_isnull[i] = true;
+			}
 
 			int i = 0;
-			int j = 1;
 			
 			foreach(lc, execstate->target_list)
 			{
 				Value *value = (Value *) lfirst(lc);
+				int pos = execstate->target_map[i];
 				
-				// Find the actual position in the TupleTableSlot that
-				// we're supposed to fill in.
-				// Here we assume that the attributes appear in the same order
-				// in the target_list as they do in the tuple descriptor.
+				debug_elog("Inserting column %d (%s) into position %d", i, strVal(value), pos);
 				
-				while (strcmp(NameStr(slot->tts_tupleDescriptor->attrs[i].attname),
-					strVal(value)))
-				{
-					slot->tts_values[i] = 0;
-					slot->tts_isnull[i] = true;
-					i++;
-					
-				}
-				debug_elog("Inserting column %d (%s) into position %d", j, strVal(value), i);
-				
-				datum = heap_getattr(tuple, j, slot->tts_tupleDescriptor, &isnull);
+				datum = heap_getattr(tuple, i+1, execstate->cursor->tupDesc, &isnull);
 				
 				if (isnull)
 				{
-					slot->tts_values[i] = 0;
-					slot->tts_isnull[i] = true;
+					slot->tts_values[pos] = 0;
+					slot->tts_isnull[pos] = true;
 				}
 				else {
-					slot->tts_values[i] = datum;
-					slot->tts_isnull[i] = false;
+					slot->tts_values[pos] = datum;
+					slot->tts_isnull[pos] = false;
 				}
-				j++;
 				i++;
 			}
-
-			// Fill out the remaining slot items with NULLs (not doing this
-			// crashes the query).
-			for (; i<slot->tts_tupleDescriptor->natts; i++)
-			{
-				slot->tts_values[i] = 0;
-				slot->tts_isnull[i] = true;
-			}
-
+			
 			ExecStoreVirtualTuple(slot);
 			
 #ifdef DEBUG
@@ -1359,6 +1363,8 @@ serializePlanState(MulticornPlanState * state)
 	result = lappend(result, state->target_list);
 
 	result = lappend(result, serializeDeparsedSortGroup(state->pathkeys));
+	
+	result = lappend(result, state->target_map);
 
 	return result;
 }
@@ -1379,6 +1385,7 @@ initializeExecState(void *internalstate)
 	/* Those list must be copied, because their memory context can become */
 	/* invalid during the execution (in particular with the cursor interface) */
 	execstate->target_list = copyObject(lthird(values));
+	execstate->target_map = list_nth(values, 4);
 	pathkeys = lfourth(values);
 	execstate->pathkeys = deserializeDeparsedSortGroup(pathkeys);
 	execstate->fdw_instance = getInstance(foreigntableid);
