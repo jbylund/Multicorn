@@ -70,9 +70,6 @@ typedef struct MulticornPlanState
 	int			startupCost;
 	ConversionInfo **cinfos;
 	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
-	int		   *target_map; // map of (position in target_list ->
-							//         position in relation's TupleDesc)
-
 	/* For some reason, `baserel->reltarget->width` gets changed
 	 * outside of our control somewhere between GetForeignPaths and
 	 * GetForeignPlan, which breaks tests.
@@ -94,7 +91,8 @@ typedef struct MulticornExecState
 	Datum	   *values;
 	bool	   *nulls;
 	ConversionInfo **cinfos;
-	int		   *target_map;
+	int		   *target_map; // map of (position in target_list ->
+							//         position in relation's TupleDesc)
 	/* Common buffer to avoid repeated allocations */
 	StringInfo	buffer;
 	AttrNumber	rowidAttno;

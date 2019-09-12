@@ -322,25 +322,6 @@ multicornGetForeignRelSize(PlannerInfo *root,
 		}
 	}
 	
-	planstate->target_map = palloc0(sizeof(int) * list_length(planstate->target_list));
-	int j = 0;
-	foreach(lc, planstate->target_list)
-	{
-		// Find out the position in the tuple table slot that this
-		// column matches.
-		for (int i = 0; i < desc->natts; i++)
-		{
-			Form_pg_attribute att = TupleDescAttr(desc, i);
-
-			if (!att->attisdropped && 
-				strcmp(NameStr(att->attname), strVal(lfirst(lc))) == 0)
-			{
-				debug_elog("Target map: %d -> %d", j, i);
-				planstate->target_map[j++] = i;
-			}
-		}
-	}
-	
 	/* Extract the restrictions from the plan. */
 	foreach(lc, baserel->baserestrictinfo)
 	{
@@ -602,6 +583,28 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 							&execstate->qual_list);
 	}
 	initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(tupdesc));
+	
+		
+	execstate->target_map = palloc0(sizeof(int) * list_length(execstate->target_list));
+	debug_elog("Creating target map, length %d", list_length(execstate->target_list));
+	int j = 0;
+	foreach(lc, execstate->target_list)
+	{
+		// Find out the position in the tuple table slot that this
+		// column matches.
+		for (int i = 0; i < tupdesc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+
+			if (!att->attisdropped && 
+				strcmp(NameStr(att->attname), strVal(lfirst(lc))) == 0)
+			{
+				debug_elog("Target map: %d -> %d", j, i);
+				execstate->target_map[j++] = i;
+				break;
+			}
+		}
+	}
 	
 	// Create a receiver for tuples we fetch from the subquery
 	execstate->receiver = CreateMulticornDestReceiver(execstate);
@@ -1363,8 +1366,6 @@ serializePlanState(MulticornPlanState * state)
 	result = lappend(result, state->target_list);
 
 	result = lappend(result, serializeDeparsedSortGroup(state->pathkeys));
-	
-	result = lappend(result, state->target_map);
 
 	return result;
 }
@@ -1385,7 +1386,6 @@ initializeExecState(void *internalstate)
 	/* Those list must be copied, because their memory context can become */
 	/* invalid during the execution (in particular with the cursor interface) */
 	execstate->target_list = copyObject(lthird(values));
-	execstate->target_map = list_nth(values, 4);
 	pathkeys = lfourth(values);
 	execstate->pathkeys = deserializeDeparsedSortGroup(pathkeys);
 	execstate->fdw_instance = getInstance(foreigntableid);
