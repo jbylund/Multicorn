@@ -14,6 +14,7 @@
 #include "optimizer/clauses.h"
 #if PG_VERSION_NUM < 120000
 #include "optimizer/var.h"
+#include "dynloader.h"
 #endif
 #include "access/reloptions.h"
 #include "access/relscan.h"
@@ -528,7 +529,12 @@ dr_multicorn_receive(TupleTableSlot *slot, DestReceiver *self)
 		return false;
 	}
 	
+	
+#if PG_VERSION_NUM < 120000
 	state->tuples[state->next_tuple++] = ExecCopySlotTuple(slot);
+#else
+	state->tuples[state->next_tuple++] = ExecCopySlotHeapTuple(slot);
+#endif
 
 	return true;
 }
