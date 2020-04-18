@@ -91,21 +91,18 @@ typedef struct MulticornExecState
 	Datum	   *values;
 	bool	   *nulls;
 	ConversionInfo **cinfos;
-	int		   *target_map; // map of (position in target_list ->
-							//         position in relation's TupleDesc)
 	/* Common buffer to avoid repeated allocations */
 	StringInfo	buffer;
 	AttrNumber	rowidAttno;
 	char	   *rowidAttrName;
 	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
-	/* Information related to executing subqueries */
-	MemoryContext  subquery_cxt; 
-	Portal         cursor;
-	DestReceiver  *receiver;
-	HeapTuple     *tuples;
-	int            num_tuples;
-	int            next_tuple;
-	int            max_tuples;
+	/* State related to scanning through CStore chunks / temporarily
+	 * materialized tables
+	 */
+	MemoryContext   subscanCxt;
+	void           *subscanState;
+	Relation        subscanRel;
+	TupleTableSlot *seqScanSlot;
 }	MulticornExecState;
 
 typedef struct MulticornModifyState

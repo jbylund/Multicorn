@@ -18,11 +18,16 @@
 #endif
 #include "access/reloptions.h"
 #include "access/relscan.h"
+#include "access/relation.h"
+#include "access/tableam.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
 #include "nodes/makefuncs.h"
 #include "catalog/pg_type.h"
+#include "catalog/namespace.h"
 #include "utils/memutils.h"
+#include "utils/varlena.h"
+#include "utils/snapmgr.h"
 #include "miscadmin.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
@@ -31,6 +36,8 @@
 #include "executor/spi.h"
 #include "nodes/print.h"
 #include "tcop/pquery.h"
+
+#include "cstore_fdw.h"
 
 
 PG_MODULE_MAGIC;
@@ -108,6 +115,7 @@ static List *multicornImportForeignSchema(ImportForeignSchemaStmt * stmt,
 static void multicorn_xact_callback(XactEvent event, void *arg);
 
 /*	Helpers functions */
+static List *buildCStoreColumnList(TupleDesc desc, List* target_list);
 void	   *serializePlanState(MulticornPlanState * planstate);
 MulticornExecState *initializeExecState(void *internal_plan_state);
 
@@ -369,7 +377,7 @@ multicornGetForeignPaths(PlannerInfo *root,
 	/* Add a simple default path */
 	pathes = lappend(pathes, create_foreignscan_path(root, baserel,
 #if PG_VERSION_NUM >= 90600
-												 	  NULL,  /* default pathtarget */
+													  NULL,  /* default pathtarget */
 #endif
 			baserel->rows,
 			planstate->startupCost,
@@ -379,7 +387,7 @@ multicornGetForeignPaths(PlannerInfo *root,
 			baserel->rows * baserel->width,
 #endif
 			NIL,		/* no pathkeys */
-		    NULL,
+			NULL,
 #if PG_VERSION_NUM >= 90500
 			NULL,
 #endif
@@ -413,7 +421,7 @@ multicornGetForeignPaths(PlannerInfo *root,
 
 			newpath = create_foreignscan_path(root, baserel,
 #if PG_VERSION_NUM >= 90600
-												 	  NULL,  /* default pathtarget */
+													  NULL,  /* default pathtarget */
 #endif
 					path->path.rows,
 					path->path.startup_cost, path->path.total_cost,
@@ -500,70 +508,6 @@ multicornExplainForeignScan(ForeignScanState *node, ExplainState *es)
 }
 
 /*
- * Receiver for Portal fetches that writes tuples into MulticornExecState
- */
-
-typedef struct
-{
-	DestReceiver pub;
-	MulticornExecState *execstate;
-} DR_multicorn;
-
-static void
-dr_multicorn_startup(DestReceiver *self, int operation, TupleDesc typeinfo) {}
-
-/*
- * receive one tuple
- */
-static bool
-dr_multicorn_receive(TupleTableSlot *slot, DestReceiver *self)
-{
-	MulticornExecState *state = ((DR_multicorn *) self)->execstate;
-	
-	if (state->next_tuple >= state->max_tuples)
-	{
-		// This shouldn't happen, as we explicltly fetched max_tuples
-		// tuples from the cursor. But just in case, we ignore tuples
-		// that we don't have space for in the buffer.
-		elog(WARNING, "DR_multicorn receive: over capacity!");
-		return false;
-	}
-	
-	
-#if PG_VERSION_NUM < 120000
-	state->tuples[state->next_tuple++] = ExecCopySlotTuple(slot);
-#else
-	state->tuples[state->next_tuple++] = ExecCopySlotHeapTuple(slot);
-#endif
-
-	return true;
-}
-
-static void
-dr_multicorn_shutdown(DestReceiver *self) { }
-
-static void
-dr_multicorn_destroy(DestReceiver *self)
-{
-	pfree(self);
-}
-
-DestReceiver *
-CreateMulticornDestReceiver(MulticornExecState *execstate)
-{
-	DR_multicorn *self = (DR_multicorn *) palloc0(sizeof(DR_multicorn));
-
-	self->pub.receiveSlot = dr_multicorn_receive;
-	self->pub.rStartup = dr_multicorn_startup;
-	self->pub.rShutdown = dr_multicorn_shutdown;
-	self->pub.rDestroy = dr_multicorn_destroy;
-	self->execstate = execstate;
-
-	return (DestReceiver *) self;
-}
-
-
-/*
  *	multicornBeginForeignScan
  *		Initialize the foreign scan.
  *		This (primarily) involves :
@@ -589,38 +533,49 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 							&execstate->qual_list);
 	}
 	initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(tupdesc));
-	
-		
-	execstate->target_map = palloc0(sizeof(int) * list_length(execstate->target_list));
-	debug_elog("Creating target map, length %d", list_length(execstate->target_list));
-	int j = 0;
-	foreach(lc, execstate->target_list)
-	{
-		// Find out the position in the tuple table slot that this
-		// column matches.
-		for (int i = 0; i < tupdesc->natts; i++)
-		{
-			Form_pg_attribute att = TupleDescAttr(tupdesc, i);
 
-			if (!att->attisdropped && 
+	execstate->subscanCxt = AllocSetContextCreate(
+		node->ss.ps.state->es_query_cxt,
+		"Multicorn subscan data",
+		ALLOCSET_DEFAULT_SIZES);
+
+	node->fdw_state = execstate;
+}
+
+/*
+ * Generate a list of columns we need from CStore.
+ *
+ * Normally, the CStore file has the same schema as our own foreign table,
+ * with the update-delete flag at the end. This means that we can build a
+ * list of variables once, from our own schema, and CStore can use it
+ * to compute a mask of which columns it needs from its file. But this
+ * can backfire if the CStore file has swapped columns, so, to make
+ * this more robust, we use the CStore's schema and grab variables
+ * from that by matching up their names and the names that we need.
+ */
+static List *buildCStoreColumnList(TupleDesc desc, List* target_list)
+{
+	List *result = NULL;
+	ListCell *lc;
+
+	foreach(lc, target_list)
+	{
+		for (int i = 0; i < desc->natts; i++)
+		{
+			Form_pg_attribute att = TupleDescAttr(desc, i);
+
+			if (!att->attisdropped &&
 				strcmp(NameStr(att->attname), strVal(lfirst(lc))) == 0)
 			{
-				debug_elog("Target map: %d -> %d", j, i);
-				execstate->target_map[j++] = i;
+				debug_elog("CStore scan: need column %s (%d)", strVal(lfirst(lc)), i);
+				result = lappend(result,
+								 makeVar(0, att->attnum, att->atttypid,
+										 att->atttypmod, att->attcollation, 0));
 				break;
 			}
 		}
 	}
-	
-	// Create a receiver for tuples we fetch from the subquery
-	execstate->receiver = CreateMulticornDestReceiver(execstate);
-	
-	execstate->subquery_cxt = AllocSetContextCreate(
-		node->ss.ps.state->es_query_cxt,
-		"Multicorn tuple data",
-		ALLOCSET_DEFAULT_SIZES);
-	
-	node->fdw_state = execstate;
+	return result;
 }
 
 /* 
@@ -649,6 +604,30 @@ static void print_desc(TupleDesc desc)
 	}
 }
 
+/*
+ * End reading from a CStore/temporarily materialized table
+ * and close the relation.
+ */
+static void end_subread(MulticornExecState *execstate)
+{
+	if (execstate->subscanRel != NULL) {
+		if (execstate->subscanRel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+		{
+			debug_elog("Closing CStore table");
+			if (execstate->subscanState) CStoreEndRead((TableReadState *)(execstate->subscanState));
+		}
+		else
+		{
+			debug_elog("Closing temporarily materialized table");
+			if (execstate->subscanState) table_endscan((TableScanDesc)(execstate->subscanState));
+		}
+		execstate->subscanState = NULL;
+		relation_close(execstate->subscanRel, AccessShareLock);
+		execstate->subscanRel = NULL;
+	}
+	if (execstate->seqScanSlot) ExecClearTuple(execstate->seqScanSlot);
+}
+
 
 /*
 * multicornIterateForeignScan
@@ -664,126 +643,70 @@ multicornIterateForeignScan(ForeignScanState *node)
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	MulticornExecState *execstate = node->fdw_state;
 	PyObject   *p_value;
-	bool		isnull;
-	Datum		datum;
-	ListCell	*lc;
+	MemoryContext oldcontext;
 	
 	/* The data flow here is kind of complex: we treat strings returned by 
-	 * Python as fully mogrified SELECT queries to read data from directly 
-	 * instead of getting Python to return it to us. To execute those queries, 
-	 * we use the Postgres SPI which gives us back a Portal (cursor). But we 
-	 * also consume tuples from the cursor in batches: they're stored in an
-	 * array in our state (tuples) and we're only supposed to return one tuple
-	 * (injected into our TupleTableSlot) per invocation. So we have to manage 
-	 * between requesting the next Python object from the iterator, requesting 
-	 * the next Portal, requesting the next TupleTableSlot and emitting single 
-	 * tuples.
+	 * Python as relation names to read data from directly instead of getting Python
+	 * to return it to us.
+	 *
+	 * To read from those relations, we use a mixture of morally dubious meddling
+	 * with CStore and heap internals, mimicking what a scan through these
+	 * subrelations actually does.
+	 *
+	 * This is made more difficult by the fact that PG query planning machinery
+	 * expects the relations to actually exist at query plan time -- for example,
+	 * CStore's read planner needs the table's RangeTblEntry to be present in the
+	 * planner's simple_rte_array, which we don't want to modify at query execution time.
 	 * 
-	 * We perform these in an infinite loop forming a kind of a state machine, 
-	 * which works around edge cases like "next SELECT query returned by Python 
-	 * actually doesn't return anything".
 	 */
 	
 	ExecClearTuple(slot);
 	while (1)
 	{
-		if (execstate->cursor != NULL && execstate->next_tuple < execstate->num_tuples)
-		{
-			// We have a cursor and our tuple table isn't exhausted.
-			
-			HeapTuple tuple = execstate->tuples[execstate->next_tuple++];
-			/* 
-			* NB we don't actually check that the TupleDesc returned by the
-			* query matches the required one: if there's a type/length
-			* mismatch, we'll likely just crash. The following statement
-			* would have been useful but it returns False even for compatible
-			* TupleDescs. 
-			*/
-			
-			// Insert the new tuple into the slot. We can't use ExecStoreTuple
-			// here, as the tuple we got back from Python has the same shape
-			// and types as what we requested from it (hopefully) whereas
-			// the slot that Postgres gave us can be as wide as the table
-			// itself (we're supposed to fill in the relevant values).
-			
-			// Clear out the slot and fill it with NULLs.
-			for (int i = 0; i<slot->tts_tupleDescriptor->natts; i++)
+		if (execstate->subscanRel != NULL) {
+			oldcontext = MemoryContextSwitchTo(execstate->subscanCxt);
+			if (execstate->subscanRel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 			{
-				slot->tts_isnull[i] = true;
-			}
+				debug_elog("Reading tuple from CStore");
+				TupleDesc tupleDescriptor = slot->tts_tupleDescriptor;
 
-			int i = 0;
-			
-			foreach(lc, execstate->target_list)
-			{
-				Value *value = (Value *) lfirst(lc);
-				int pos = execstate->target_map[i];
-				
-				debug_elog("Inserting column %d (%s) into position %d", i, strVal(value), pos);
-				
-				datum = heap_getattr(tuple, i+1, execstate->cursor->tupDesc, &isnull);
-				
-				if (isnull)
-				{
-					slot->tts_values[pos] = 0;
-					slot->tts_isnull[pos] = true;
-				}
-				else {
-					slot->tts_values[pos] = datum;
-					slot->tts_isnull[pos] = false;
-				}
-				i++;
-			}
-			
-			ExecStoreVirtualTuple(slot);
-			
+				/* Code partially copied from CStoreIterateForeignScan */
+				memset(slot->tts_values, 0, tupleDescriptor->natts * sizeof(Datum));
+				memset(slot->tts_isnull, true, tupleDescriptor->natts * sizeof(bool));
+				ExecClearTuple(slot);
+
+				if (CStoreReadNextRow((TableReadState *)(execstate->subscanState),
+									  slot->tts_values,
+									  slot->tts_isnull)) {
+					ExecStoreVirtualTuple(slot);
+
 #ifdef DEBUG
-			print_desc(slot->tts_tupleDescriptor);
-			print_slot(slot);
-			fflush(stdout);
+					print_desc(slot->tts_tupleDescriptor);
+					print_slot(slot);
+					fflush(stdout);
 #endif
-			return slot;
-		}
-		
-		if (execstate->cursor != NULL)
-		{
-			MemoryContext oldcontext;
-
-			// Flush the previous batch of tuple and allocate a new one.
-			execstate->tuples = NULL;
-			MemoryContextReset(execstate->subquery_cxt);
-			oldcontext = MemoryContextSwitchTo(execstate->subquery_cxt);
-			
-			execstate->max_tuples = 10000;
-			execstate->tuples = (HeapTuple *) palloc0(execstate->max_tuples * sizeof(HeapTuple));
-			execstate->next_tuple = 0;
-			
-			execstate->num_tuples = 
-				PortalRunFetch(execstate->cursor, FETCH_FORWARD,
-							   execstate->max_tuples, execstate->receiver);
-			debug_elog("Fetched %d row(s)", execstate->num_tuples);
-			
-			// Reset the position in the tuples array
-			execstate->next_tuple = 0;
-			MemoryContextSwitchTo(oldcontext);
-			
-			if (execstate->num_tuples == 0)
-			{
-				/* If we've exhausted the cursor, close it and set it to NULL.
-				 * The next block of code will try to get the next item from 
-				 * the Python iterator.
-				 */
-				
-				PortalDrop(execstate->cursor, false);
-				execstate->cursor = NULL;
+					return slot;
+				}
+				end_subread(execstate);
 			}
 			else
 			{
-				// If there's stuff in the cursor, read it
-				continue;
+				debug_elog("Reading tuple from materialized table");
+				if (table_scan_getnextslot((TableScanDesc)(execstate->subscanState),
+										   ForwardScanDirection,
+										   execstate->seqScanSlot))
+				{
+
+#ifdef DEBUG
+					print_desc(execstate->seqScanSlot->tts_tupleDescriptor);
+					print_slot(execstate->seqScanSlot);
+					fflush(stdout);
+#endif
+					return execstate->seqScanSlot;
+				}
+				end_subread(execstate);
 			}
 		}
-		
 		// Get the next item from the iterator
 		if (execstate->p_iterator == NULL)
 		{
@@ -806,59 +729,68 @@ multicornIterateForeignScan(ForeignScanState *node)
 
 		if (PyBytes_Check(p_value))
 		{
-			/* If the iterator is a Bytes object, treat it as a fully mogrified 
-			 * SELECT query that talks to  a Postgres table.
+			/*
+			 * If the iterator is a Bytes object, treat it as a relation
+			 * to read data from (a cstore_fdw foreign table or a temporary
+			 * table with materialization results);
 			 */
-			SPIPlanPtr plan;
-			
-			// Extract the query and open a Portal (cursor).
-			char	   *statement;
+
+			char	   *relation;
 			Py_ssize_t	strlength = 0;
 			
-			if (PyString_AsStringAndSize(p_value, &statement, &strlength) < 0)
+			if (PyString_AsStringAndSize(p_value, &relation, &strlength) < 0)
 			{
-				elog(ERROR, "Could not convert subquery to string!");
+				elog(ERROR, "Could not convert subrelation to string!");
 			}
-			
-			/* Prepare a plan (no arguments) and open a Portal 
-			 * (random name, no arguments, no nulls, read-write).
-			 * 
-			 * Seems like we need a read-write Portal because otherwise
-			 * we see a snapshot from before this query began: if the Python
-			 * process created a temporary table to write data into, we won't
-			 * see any data in the table in read-only mode.
-			 * 
-			 * Here, we use the SPI to do the legwork of preparing a Portal
-			 * for us. We can't really use the SPI to scan through the
-			 * actual portal as we're not supposed to leave the function
-			 * that the SPI "connection" is open in: if we return a tuple
-			 * from here and then another Multicorn plan is executed which
-			 * also calls SPI_connect, the two SPI "contexts" will conflict
-			 * with each other, leading to bizarre bugs and crashes.
-			 */ 
-			
-			SPI_connect();
-			debug_elog("Running query %s", statement);
-			plan = SPI_prepare(statement, 0, NULL);
-			if (SPI_result != 0)
-			{
-				elog(WARNING, "Error preparing query plan for %s, status %d", 
-					 statement, SPI_result);
-			}
-						
-			execstate->cursor = SPI_cursor_open(NULL, plan, NULL, NULL, false);
-			if (SPI_result != 0)
-			{
-				elog(WARNING, "Error opening cursor for %s, status %d", 
-					 statement, SPI_result);
-			}
-			
-			debug_elog("Portal opened, exiting SPI");
-			SPI_finish();
-			/* Continue without doing anything else (like trying to read from 
-			 * the cursor), the next iteration will pick that up.
-			 */
+
+			debug_elog("Will get data from subrelation %s", relation);
 			Py_DECREF(p_value);
+
+			RangeVar *rangeVar = makeRangeVarFromNameList(
+						textToQualifiedNameList(cstring_to_text(relation)));
+			Relation subscanRel = relation_openrv(rangeVar, AccessShareLock);
+			debug_elog("Opened relation %s", relation);
+			execstate->subscanRel = subscanRel;
+
+			/*
+			 * Use a per-query context here that we made at scan start.
+			 *
+			 * Normally these methods are supposed to be called when the scan begins. In this case we're
+			 * in the per-tuple context that gets reset after every tuple, so whatever
+			 * CStore/heapam allocated for its query-lived buffers will get nuked, which
+			 * we don't want to happen.
+			 */
+			oldcontext = MemoryContextSwitchTo(execstate->subscanCxt);
+			if (subscanRel->rd_rel->relkind == RELKIND_FOREIGN_TABLE) {
+				/*
+				 * If we opened a foreign table, use CStore routines to begin the read
+				 * Partially copied from CStoreBeginForeignScan
+				 */
+				CStoreFdwOptions *cStoreFdwOptions = CStoreGetOptions(subscanRel->rd_id);
+				TupleDesc desc = RelationGetDescr(subscanRel);
+
+				execstate->subscanState = CStoreBeginRead(cStoreFdwOptions->filename,
+														  desc,
+														  buildCStoreColumnList(desc, execstate->target_list),
+														  node->ss.ps.plan->qual);
+			} else {
+				/*
+				 * Begin the read through a temporarily materialized table.
+				 * We use the latest snapshot instead of the current transaction
+				 * snapshot. This breaks isolation, but otherwise we can't see
+				 * the temporary table that Python wrote into.
+				 */
+				execstate->subscanState = table_beginscan(subscanRel,
+														  GetLatestSnapshot(),
+														  0, NULL);
+				/* For scans through temporarily materialized tables, we need to use
+				 * an on-disk heap tuple slot (rather than heap tuple slot that we're given as an FDW)
+				 */
+				execstate->seqScanSlot = ExecAllocTableSlot(&node->ss.ps.state->es_tupleTable,
+															RelationGetDescr(subscanRel),
+															table_slot_callbacks(subscanRel));
+			}
+			MemoryContextSwitchTo(oldcontext);
 		}
 		else
 		{
@@ -887,16 +819,7 @@ multicornReScanForeignScan(ForeignScanState *node)
 		Py_DECREF(state->p_iterator);
 		state->p_iterator = NULL;
 	}
-	
-	if (state->cursor)
-	{
-		PortalDrop(state->cursor, false);
-		state->cursor = NULL;
-	}
-	
-	state->next_tuple = 0;
-	state->max_tuples = 0;
-	state->num_tuples = 0;
+	end_subread(state);
 }
 
 /*
@@ -914,18 +837,8 @@ multicornEndForeignScan(ForeignScanState *node)
 	Py_DECREF(state->fdw_instance);
 	Py_XDECREF(state->p_iterator);
 	state->p_iterator = NULL;
+	end_subread(state);
 
-	if (state->cursor)
-	{
-		PortalDrop(state->cursor, false);
-		state->cursor = NULL;
-	}
-	
-	if (state->receiver)
-	{
-		state->receiver->rDestroy(state->receiver);
-	}
-	
 	/* MemoryContexts will be deleted automatically. */
 }
 
@@ -1399,6 +1312,7 @@ initializeExecState(void *internalstate)
 	execstate->cinfos = palloc0(sizeof(ConversionInfo *) * attnum);
 	execstate->values = palloc(attnum * sizeof(Datum));
 	execstate->nulls = palloc(attnum * sizeof(bool));
-	execstate->cursor = NULL;
+	execstate->subscanRel = NULL;
+	execstate->subscanState = NULL;
 	return execstate;
 }
