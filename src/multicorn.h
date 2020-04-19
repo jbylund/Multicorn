@@ -103,6 +103,7 @@ typedef struct MulticornExecState
 	void           *subscanState;
 	Relation        subscanRel;
 	TupleTableSlot *seqScanSlot;
+    uint64          tuplesRead;
 }	MulticornExecState;
 
 typedef struct MulticornModifyState

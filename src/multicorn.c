@@ -115,7 +115,7 @@ static List *multicornImportForeignSchema(ImportForeignSchemaStmt * stmt,
 static void multicorn_xact_callback(XactEvent event, void *arg);
 
 /*	Helpers functions */
-static List *buildCStoreColumnList(TupleDesc desc, List* target_list);
+static List *buildCStoreColumnList(TupleDesc desc, List* target_list, Index relid);
 void	   *serializePlanState(MulticornPlanState * planstate);
 MulticornExecState *initializeExecState(void *internal_plan_state);
 
@@ -553,7 +553,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
  * this more robust, we use the CStore's schema and grab variables
  * from that by matching up their names and the names that we need.
  */
-static List *buildCStoreColumnList(TupleDesc desc, List* target_list)
+static List *buildCStoreColumnList(TupleDesc desc, List* target_list, Index relid)
 {
 	List *result = NULL;
 	ListCell *lc;
@@ -569,7 +569,7 @@ static List *buildCStoreColumnList(TupleDesc desc, List* target_list)
 			{
 				debug_elog("CStore scan: need column %s (%d)", strVal(lfirst(lc)), i);
 				result = lappend(result,
-								 makeVar(0, att->attnum, att->atttypid,
+								 makeVar(relid, att->attnum, att->atttypid,
 										 att->atttypmod, att->attcollation, 0));
 				break;
 			}
@@ -621,6 +621,7 @@ static void end_subread(MulticornExecState *execstate)
 			debug_elog("Closing temporarily materialized table");
 			if (execstate->subscanState) table_endscan((TableScanDesc)(execstate->subscanState));
 		}
+		debug_elog("Read %d tuple(s)", execstate->tuplesRead);
 		execstate->subscanState = NULL;
 		relation_close(execstate->subscanRel, AccessShareLock);
 		execstate->subscanRel = NULL;
@@ -679,7 +680,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 									  slot->tts_values,
 									  slot->tts_isnull)) {
 					ExecStoreVirtualTuple(slot);
-
+					execstate->tuplesRead++;
 #ifdef DEBUG
 					print_desc(slot->tts_tupleDescriptor);
 					print_slot(slot);
@@ -768,11 +769,18 @@ multicornIterateForeignScan(ForeignScanState *node)
 				 */
 				CStoreFdwOptions *cStoreFdwOptions = CStoreGetOptions(subscanRel->rd_id);
 				TupleDesc desc = RelationGetDescr(subscanRel);
-
+				ForeignScan *foreignScan = (ForeignScan *) node->ss.ps.plan;
+				execstate->tuplesRead = 0;
 				execstate->subscanState = CStoreBeginRead(cStoreFdwOptions->filename,
 														  desc,
-														  buildCStoreColumnList(desc, execstate->target_list),
-														  node->ss.ps.plan->qual);
+														  buildCStoreColumnList(desc,
+																				execstate->target_list,
+																				foreignScan->scan.scanrelid),
+														  foreignScan->scan.plan.qual);
+				// TODO
+				// take foreignScan->scan.plan.qual
+				// use map_variable_attnos to rewrite the tree so that
+				// it's referencing the attnos in correct places
 			} else {
 				/*
 				 * Begin the read through a temporarily materialized table.
