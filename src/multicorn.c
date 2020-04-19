@@ -621,7 +621,7 @@ static void end_subread(MulticornExecState *execstate)
 			debug_elog("Closing temporarily materialized table");
 			if (execstate->subscanState) table_endscan((TableScanDesc)(execstate->subscanState));
 		}
-		debug_elog("Read %d tuple(s)", execstate->tuplesRead);
+		debug_elog("Read %ld tuple(s)", execstate->tuplesRead);
 		execstate->subscanState = NULL;
 		relation_close(execstate->subscanRel, AccessShareLock);
 		execstate->subscanRel = NULL;
