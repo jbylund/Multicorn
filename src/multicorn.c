@@ -22,6 +22,7 @@
 #include "access/tableam.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
+#include "rewrite/rewriteManip.h"
 #include "nodes/makefuncs.h"
 #include "catalog/pg_type.h"
 #include "catalog/namespace.h"
@@ -114,8 +115,14 @@ static List *multicornImportForeignSchema(ImportForeignSchemaStmt * stmt,
 
 static void multicorn_xact_callback(XactEvent event, void *arg);
 
+/* Functions relating to scanning through subrelations */
+static bool subscanReadRow(TupleTableSlot *slot, Relation subscanRel, void *subscanState);
+static void subscanEnd(MulticornExecState *execstate);
+
 /*	Helpers functions */
+static AttrNumber *buildConvertMapIfNeeded(TupleDesc indesc, TupleDesc outDesc);
 static List *buildCStoreColumnList(TupleDesc desc, List* target_list, Index relid);
+static List *buildCStoreQualList(AttrNumber *attrMap, int map_length, List *quals, Index relid);
 void	   *serializePlanState(MulticornPlanState * planstate);
 MulticornExecState *initializeExecState(void *internal_plan_state);
 
@@ -543,6 +550,68 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 }
 
 /*
+ * Wrapper around convert_tuples_by_name_map that returns NULL if the
+ * CStore table/temporary materialization and our table are compatible.
+ * We have a looser definition of compatibility than convert_tuples_by_name_map_if_req,
+ * since we only need the indesc descriptor to start with the same columns in the same positions
+ * (we request a set of columns from CStore and want them in the same positions in its
+ * tuple slot as our tuple slot -- so if the CStore table has extra columns like
+ * SG_UD_FLAG, we don't care.
+ */
+static AttrNumber *buildConvertMapIfNeeded(TupleDesc indesc, TupleDesc outdesc)
+{
+	AttrNumber *attrMap = convert_tuples_by_name_map(indesc, outdesc, "Error building subrelation attribute map");
+	bool same = true;
+
+	if (outdesc->natts <= indesc->natts)
+	{
+		for (int i = 0; i < outdesc->natts; i++)
+		{
+			Form_pg_attribute inatt = TupleDescAttr(indesc, i);
+			Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
+
+			/*
+			 * If the input column has a missing attribute, we need a
+			 * conversion.
+			 */
+			if (inatt->atthasmissing)
+			{
+				same = false;
+				break;
+			}
+
+			if (attrMap[i] == (i + 1))
+				continue;
+
+			/*
+			 * If it's a dropped column and the corresponding input column is
+			 * also dropped, we needn't convert.  However, attlen and attalign
+			 * must agree.
+			 */
+			if (attrMap[i] == 0 &&
+				inatt->attisdropped &&
+				inatt->attlen == outatt->attlen &&
+				inatt->attalign == outatt->attalign)
+				continue;
+
+			same = false;
+			break;
+		}
+	} else
+		same = false;
+
+	if (same)
+	{
+		/* Runtime conversion is not needed */
+		debug_elog("Runtime conversion is not needed");
+		pfree(attrMap);
+		return NULL;
+	}
+	else
+		return attrMap;
+}
+
+/*
  * Generate a list of columns we need from CStore.
  *
  * Normally, the CStore file has the same schema as our own foreign table,
@@ -567,7 +636,7 @@ static List *buildCStoreColumnList(TupleDesc desc, List* target_list, Index reli
 			if (!att->attisdropped &&
 				strcmp(NameStr(att->attname), strVal(lfirst(lc))) == 0)
 			{
-				debug_elog("CStore scan: need column %s (%d)", strVal(lfirst(lc)), i);
+				debug_elog("CStore scan: need column %s (%d, attnum %d)", strVal(lfirst(lc)), i, att->attnum);
 				result = lappend(result,
 								 makeVar(relid, att->attnum, att->atttypid,
 										 att->atttypmod, att->attcollation, 0));
@@ -575,6 +644,50 @@ static List *buildCStoreColumnList(TupleDesc desc, List* target_list, Index reli
 			}
 		}
 	}
+#ifdef DEBUG
+	pprint(result);
+#endif
+	return result;
+}
+
+static void print_map(AttrNumber *attrMap, int map_length)
+{
+	for (int i = 0; i < map_length; i++)
+	{
+		printf("%d -> %d\n", i, attrMap[i]);
+	}
+}
+
+static List *buildCStoreQualList(AttrNumber *attrMap, int map_length, List *quals, Index relid)
+{
+	List *result = NULL;
+	ListCell *lc;
+	bool whole_row;
+
+	if (!attrMap) return quals;
+
+#ifdef DEBUG
+	print_map(attrMap, map_length);
+#endif
+
+	foreach(lc, quals)
+	{
+		/* map_variable_attnos replaces varattno n with attrMap[n-1] */
+		Node *lqQual = lfirst(lc);
+		Node *qual = map_variable_attnos(lqQual, relid, 0, attrMap, map_length, InvalidOid, &whole_row);
+		if (whole_row)
+		{
+			ereport(ERROR, (errmsg("Error remapping LQFDW -> CStore qualifiers (whole row needs to be converted)")));
+		}
+#ifdef DEBUG
+		printf("LQ QUAL\n");
+		pprint(lqQual);
+		printf("CStore QUAL\n");
+		pprint(qual);
+#endif
+		result = lappend(result, qual);
+	}
+
 	return result;
 }
 
@@ -608,7 +721,7 @@ static void print_desc(TupleDesc desc)
  * End reading from a CStore/temporarily materialized table
  * and close the relation.
  */
-static void end_subread(MulticornExecState *execstate)
+static void subscanEnd(MulticornExecState *execstate)
 {
 	if (execstate->subscanRel != NULL) {
 		if (execstate->subscanRel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
@@ -626,7 +739,43 @@ static void end_subread(MulticornExecState *execstate)
 		relation_close(execstate->subscanRel, AccessShareLock);
 		execstate->subscanRel = NULL;
 	}
-	if (execstate->seqScanSlot) ExecClearTuple(execstate->seqScanSlot);
+	if (execstate->subscanSlot)
+	{
+		ExecClearTuple(execstate->subscanSlot);
+		execstate->subscanSlot = NULL;
+	}
+	MemoryContextReset(execstate->subscanCxt);
+}
+
+/*
+ * Read a single row from the subscan relatio
+ */
+static bool subscanReadRow(TupleTableSlot *slot, Relation subscanRel, void *subscanState)
+{
+	ExecClearTuple(slot);
+	if (subscanRel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+	{
+		TupleDesc tupleDescriptor = slot->tts_tupleDescriptor;
+
+		/* Code partially copied from CStoreIterateForeignScan */
+		memset(slot->tts_values, 0, tupleDescriptor->natts * sizeof(Datum));
+		memset(slot->tts_isnull, true, tupleDescriptor->natts * sizeof(bool));
+
+		if (CStoreReadNextRow((TableReadState *)subscanState,
+							  slot->tts_values,
+							  slot->tts_isnull)) {
+
+			ExecStoreVirtualTuple(slot);
+			return true;
+		}
+	}
+	else
+	{
+		return (table_scan_getnextslot((TableScanDesc)subscanState,
+							   ForwardScanDirection,
+							   slot));
+	}
+	return false;
 }
 
 
@@ -666,47 +815,35 @@ multicornIterateForeignScan(ForeignScanState *node)
 	{
 		if (execstate->subscanRel != NULL) {
 			oldcontext = MemoryContextSwitchTo(execstate->subscanCxt);
-			if (execstate->subscanRel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+			if (subscanReadRow(execstate->subscanSlot, execstate->subscanRel, execstate->subscanState))
 			{
-				debug_elog("Reading tuple from CStore");
-				TupleDesc tupleDescriptor = slot->tts_tupleDescriptor;
-
-				/* Code partially copied from CStoreIterateForeignScan */
-				memset(slot->tts_values, 0, tupleDescriptor->natts * sizeof(Datum));
-				memset(slot->tts_isnull, true, tupleDescriptor->natts * sizeof(bool));
-				ExecClearTuple(slot);
-
-				if (CStoreReadNextRow((TableReadState *)(execstate->subscanState),
-									  slot->tts_values,
-									  slot->tts_isnull)) {
-					ExecStoreVirtualTuple(slot);
-					execstate->tuplesRead++;
-#ifdef DEBUG
-					print_desc(slot->tts_tupleDescriptor);
-					print_slot(slot);
-					fflush(stdout);
-#endif
-					return slot;
+				if (execstate->subscanAttrMap)
+				{
+					/* Project the tuple into our own slot if the two tables are incompatible.
+					 * This should only happen if the CStore fragment has the updated-deleted flag
+					 * as its first column (which doesn't happen in the default Splitgraph configuration).
+					 * Skipping this step if the tables are compatible speeds big scans by about 10-20%.
+					 *
+					 * If the two tables are compatible, execstate->subscanSlot maps to the same slot as the
+					 * slot for the foreign scan itself.
+					 */
+					execute_attr_map_slot(execstate->subscanAttrMap,
+										  execstate->subscanSlot,
+										  slot);
 				}
-				end_subread(execstate);
+
+//#ifdef DEBUG
+//					print_desc(subscanSlot->tts_tupleDescriptor);
+//					print_slot(subscanSlot);
+//					fflush(stdout);
+//#endif
 			}
 			else
 			{
-				debug_elog("Reading tuple from materialized table");
-				if (table_scan_getnextslot((TableScanDesc)(execstate->subscanState),
-										   ForwardScanDirection,
-										   execstate->seqScanSlot))
-				{
-
-#ifdef DEBUG
-					print_desc(execstate->seqScanSlot->tts_tupleDescriptor);
-					print_slot(execstate->seqScanSlot);
-					fflush(stdout);
-#endif
-					return execstate->seqScanSlot;
-				}
-				end_subread(execstate);
+				subscanEnd(execstate);
 			}
+			MemoryContextSwitchTo(oldcontext);
+			return slot;
 		}
 		// Get the next item from the iterator
 		if (execstate->p_iterator == NULL)
@@ -762,25 +899,36 @@ multicornIterateForeignScan(ForeignScanState *node)
 			 * we don't want to happen.
 			 */
 			oldcontext = MemoryContextSwitchTo(execstate->subscanCxt);
+			TupleDesc desc = RelationGetDescr(subscanRel);
+			execstate->tuplesRead = 0;
+			execstate->subscanAttrMap = buildConvertMapIfNeeded(desc, slot->tts_tupleDescriptor);
+			if (execstate->subscanAttrMap)
+			{
+				/* Allocate a tuple table slot for the subscan if we need conversion */
+				execstate->subscanSlot = ExecAllocTableSlot(&node->ss.ps.state->es_tupleTable,
+															desc,
+															table_slot_callbacks(subscanRel));
+			}
+			else
+			{
+				execstate->subscanSlot = slot;
+			}
+
 			if (subscanRel->rd_rel->relkind == RELKIND_FOREIGN_TABLE) {
 				/*
 				 * If we opened a foreign table, use CStore routines to begin the read
 				 * Partially copied from CStoreBeginForeignScan
 				 */
 				CStoreFdwOptions *cStoreFdwOptions = CStoreGetOptions(subscanRel->rd_id);
-				TupleDesc desc = RelationGetDescr(subscanRel);
 				ForeignScan *foreignScan = (ForeignScan *) node->ss.ps.plan;
-				execstate->tuplesRead = 0;
-				execstate->subscanState = CStoreBeginRead(cStoreFdwOptions->filename,
-														  desc,
-														  buildCStoreColumnList(desc,
-																				execstate->target_list,
-																				foreignScan->scan.scanrelid),
-														  foreignScan->scan.plan.qual);
-				// TODO
-				// take foreignScan->scan.plan.qual
-				// use map_variable_attnos to rewrite the tree so that
-				// it's referencing the attnos in correct places
+				List *cStoreColumns = buildCStoreColumnList(desc, execstate->target_list,
+															foreignScan->scan.scanrelid);
+				List *cStoreQuals = buildCStoreQualList(execstate->subscanAttrMap,
+														slot->tts_tupleDescriptor->natts,
+														foreignScan->scan.plan.qual,
+														foreignScan->scan.scanrelid);
+				execstate->subscanState = CStoreBeginRead(cStoreFdwOptions->filename, desc,
+														  cStoreColumns, cStoreQuals);
 			} else {
 				/*
 				 * Begin the read through a temporarily materialized table.
@@ -791,12 +939,6 @@ multicornIterateForeignScan(ForeignScanState *node)
 				execstate->subscanState = table_beginscan(subscanRel,
 														  GetLatestSnapshot(),
 														  0, NULL);
-				/* For scans through temporarily materialized tables, we need to use
-				 * an on-disk heap tuple slot (rather than heap tuple slot that we're given as an FDW)
-				 */
-				execstate->seqScanSlot = ExecAllocTableSlot(&node->ss.ps.state->es_tupleTable,
-															RelationGetDescr(subscanRel),
-															table_slot_callbacks(subscanRel));
 			}
 			MemoryContextSwitchTo(oldcontext);
 		}
@@ -827,7 +969,7 @@ multicornReScanForeignScan(ForeignScanState *node)
 		Py_DECREF(state->p_iterator);
 		state->p_iterator = NULL;
 	}
-	end_subread(state);
+	subscanEnd(state);
 }
 
 /*
@@ -845,7 +987,7 @@ multicornEndForeignScan(ForeignScanState *node)
 	Py_DECREF(state->fdw_instance);
 	Py_XDECREF(state->p_iterator);
 	state->p_iterator = NULL;
-	end_subread(state);
+	subscanEnd(state);
 
 	/* MemoryContexts will be deleted automatically. */
 }
