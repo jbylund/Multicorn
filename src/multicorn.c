@@ -297,7 +297,20 @@ multicornGetForeignRelSize(PlannerInfo *root,
 		planstate->cinfos = palloc0(sizeof(ConversionInfo *) *
 									planstate->numattrs);
 		initConversioninfo(planstate->cinfos, attinmeta);
-		needWholeRow = rel->trigdesc && rel->trigdesc->trig_insert_after_row;
+		/*
+		 * needWholeRow = rel->trigdesc && rel->trigdesc->trig_insert_after_row;
+		 *
+		 * Multicorn seems to use this for some reason -- fetch the whole row if there's a
+		 * trigger on the table. Looks like this is for writing only (return the written
+		 * row after write for the trigger?) but no other FDW does this. Also, this forces
+		 * Multicorn to ask for all columns in all cases, which means that we force
+		 * CStore to read more data (since CStore data is arranged column-first,
+		 * this is a big slowdown). Disabling this doesn't seem to break things yet
+		 * and brings us within 10-20ms of scanning through an equivalent big CStore table.
+		 *
+		 * If this does start to break, uncomment this.
+		 */
+		needWholeRow = false;
 		RelationClose(rel);
 	}
 	if (needWholeRow)
@@ -817,7 +830,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 			oldcontext = MemoryContextSwitchTo(execstate->subscanCxt);
 			if (subscanReadRow(execstate->subscanSlot, execstate->subscanRel, execstate->subscanState))
 			{
-				if (execstate->subscanAttrMap)
+				if (execstate->subscanAttrMap || execstate->subscanRel->rd_rel->relkind != RELKIND_FOREIGN_TABLE)
 				{
 					/* Project the tuple into our own slot if the two tables are incompatible.
 					 * This should only happen if the CStore fragment has the updated-deleted flag
@@ -831,6 +844,8 @@ multicornIterateForeignScan(ForeignScanState *node)
 										  execstate->subscanSlot,
 										  slot);
 				}
+				MemoryContextSwitchTo(oldcontext);
+				return slot;
 
 //#ifdef DEBUG
 //					print_desc(subscanSlot->tts_tupleDescriptor);
@@ -843,7 +858,6 @@ multicornIterateForeignScan(ForeignScanState *node)
 				subscanEnd(execstate);
 			}
 			MemoryContextSwitchTo(oldcontext);
-			return slot;
 		}
 		// Get the next item from the iterator
 		if (execstate->p_iterator == NULL)
@@ -902,9 +916,12 @@ multicornIterateForeignScan(ForeignScanState *node)
 			TupleDesc desc = RelationGetDescr(subscanRel);
 			execstate->tuplesRead = 0;
 			execstate->subscanAttrMap = buildConvertMapIfNeeded(desc, slot->tts_tupleDescriptor);
-			if (execstate->subscanAttrMap)
+			if (execstate->subscanAttrMap || subscanRel->rd_rel->relkind != RELKIND_FOREIGN_TABLE)
 			{
-				/* Allocate a tuple table slot for the subscan if we need conversion */
+				/* Allocate a tuple table slot for the subscan if we need conversion
+				 * or we're scanning through a temporarily materialized table that needs
+				 * a special kind of tuple slot.
+				 */
 				execstate->subscanSlot = ExecAllocTableSlot(&node->ss.ps.state->es_tupleTable,
 															desc,
 															table_slot_callbacks(subscanRel));
