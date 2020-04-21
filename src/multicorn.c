@@ -830,7 +830,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 			oldcontext = MemoryContextSwitchTo(execstate->subscanCxt);
 			if (subscanReadRow(execstate->subscanSlot, execstate->subscanRel, execstate->subscanState))
 			{
-				if (execstate->subscanAttrMap || execstate->subscanRel->rd_rel->relkind != RELKIND_FOREIGN_TABLE)
+				if (execstate->subscanAttrMap)
 				{
 					/* Project the tuple into our own slot if the two tables are incompatible.
 					 * This should only happen if the CStore fragment has the updated-deleted flag
@@ -843,6 +843,14 @@ multicornIterateForeignScan(ForeignScanState *node)
 					execute_attr_map_slot(execstate->subscanAttrMap,
 										  execstate->subscanSlot,
 										  slot);
+				}
+				else if (execstate->subscanRel->rd_rel->relkind != RELKIND_FOREIGN_TABLE)
+				{
+					/* For temporarily materialized tables, return the slot that
+					 * they were writing into.
+					 */
+					MemoryContextSwitchTo(oldcontext);
+					return execstate->subscanSlot;
 				}
 				MemoryContextSwitchTo(oldcontext);
 				return slot;
