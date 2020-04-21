@@ -117,7 +117,7 @@ static void multicorn_xact_callback(XactEvent event, void *arg);
 
 /* Functions relating to scanning through subrelations */
 static bool subscanReadRow(TupleTableSlot *slot, Relation subscanRel, void *subscanState);
-static void subscanEnd(MulticornExecState *execstate);
+static void subscanEnd(ForeignScanState *node);
 
 /*	Helpers functions */
 static AttrNumber *buildConvertMapIfNeeded(TupleDesc indesc, TupleDesc outDesc);
@@ -734,8 +734,10 @@ static void print_desc(TupleDesc desc)
  * End reading from a CStore/temporarily materialized table
  * and close the relation.
  */
-static void subscanEnd(MulticornExecState *execstate)
+static void subscanEnd(ForeignScanState *node)
 {
+	MulticornExecState *execstate = node->fdw_state;
+
 	if (execstate->subscanRel != NULL) {
 		if (execstate->subscanRel->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
 		{
@@ -752,9 +754,9 @@ static void subscanEnd(MulticornExecState *execstate)
 		relation_close(execstate->subscanRel, AccessShareLock);
 		execstate->subscanRel = NULL;
 	}
-	if (execstate->subscanSlot)
+	if (execstate->subscanSlot && execstate->subscanSlot != node->ss.ss_ScanTupleSlot)
 	{
-		ExecClearTuple(execstate->subscanSlot);
+		ExecDropSingleTupleTableSlot(execstate->subscanSlot);
 		execstate->subscanSlot = NULL;
 	}
 	MemoryContextReset(execstate->subscanCxt);
@@ -863,7 +865,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 			}
 			else
 			{
-				subscanEnd(execstate);
+				subscanEnd(node);
 			}
 			MemoryContextSwitchTo(oldcontext);
 		}
@@ -930,9 +932,8 @@ multicornIterateForeignScan(ForeignScanState *node)
 				 * or we're scanning through a temporarily materialized table that needs
 				 * a special kind of tuple slot.
 				 */
-				execstate->subscanSlot = ExecAllocTableSlot(&node->ss.ps.state->es_tupleTable,
-															desc,
-															table_slot_callbacks(subscanRel));
+				execstate->subscanSlot = MakeSingleTupleTableSlot(desc,
+																  table_slot_callbacks(subscanRel));
 			}
 			else
 			{
@@ -976,7 +977,6 @@ multicornIterateForeignScan(ForeignScanState *node)
 			Py_DECREF(p_value);
 			return slot;
 		}
-
 	}
 }
 
@@ -994,7 +994,7 @@ multicornReScanForeignScan(ForeignScanState *node)
 		Py_DECREF(state->p_iterator);
 		state->p_iterator = NULL;
 	}
-	subscanEnd(state);
+	subscanEnd(node);
 }
 
 /*
@@ -1012,7 +1012,7 @@ multicornEndForeignScan(ForeignScanState *node)
 	Py_DECREF(state->fdw_instance);
 	Py_XDECREF(state->p_iterator);
 	state->p_iterator = NULL;
-	subscanEnd(state);
+	subscanEnd(node);
 
 	/* MemoryContexts will be deleted automatically. */
 }
