@@ -149,13 +149,14 @@ such as pymysql):
   );
 
 """
+from sqlalchemy import create_engine, alias, subquery
+from sqlalchemy.engine.url import make_url, URL
+from sqlalchemy.exc import UnsupportedCompilationError
+from sqlalchemy.sql import select, operators as sqlops, and_
+from sqlalchemy.sql.expression import nullsfirst, nullslast, text
 
 from . import ForeignDataWrapper, TableDefinition, ColumnDefinition
 from .utils import log_to_postgres, ERROR, WARNING, DEBUG
-from sqlalchemy import create_engine
-from sqlalchemy.engine.url import make_url, URL
-from sqlalchemy.sql import select, operators as sqlops, and_
-from sqlalchemy.sql.expression import nullsfirst, nullslast
 
 # Handle the sqlalchemy 0.8 / 0.9 changes
 try:
@@ -173,8 +174,16 @@ from sqlalchemy.schema import Table, Column, MetaData
 from sqlalchemy.dialects.mssql import base as mssql_dialect
 from sqlalchemy.dialects.oracle import base as oracle_dialect
 from sqlalchemy.dialects.postgresql.base import (
-    ischema_names, PGDialect, NUMERIC, SMALLINT, VARCHAR, TIMESTAMP, BYTEA,
-    BOOLEAN, TEXT)
+    ischema_names,
+    PGDialect,
+    NUMERIC,
+    SMALLINT,
+    VARCHAR,
+    TIMESTAMP,
+    BYTEA,
+    BOOLEAN,
+    TEXT,
+)
 import re
 import operator
 
@@ -194,68 +203,74 @@ def not_(function):
 
 
 def _parse_url_from_options(fdw_options):
-    if fdw_options.get('db_url'):
-        url = make_url(fdw_options.get('db_url'))
+    if fdw_options.get("db_url"):
+        url = make_url(fdw_options.get("db_url"))
     else:
-        if 'drivername' not in fdw_options:
-            log_to_postgres('Either a db_url, or drivername and other '
-                            'connection infos are needed', ERROR)
-        url = URL(fdw_options['drivername'])
-    for param in ('username', 'password', 'host',
-                    'database', 'port'):
+        if "drivername" not in fdw_options:
+            log_to_postgres(
+                "Either a db_url, or drivername and other "
+                "connection infos are needed",
+                ERROR,
+            )
+        url = URL(fdw_options["drivername"])
+    for param in ("username", "password", "host", "database", "port"):
         if param in fdw_options:
             setattr(url, param, fdw_options[param])
     return url
 
 
-
 OPERATORS = {
-    '=': operator.eq,
-    '<': operator.lt,
-    '>': operator.gt,
-    '<=': operator.le,
-    '>=': operator.ge,
-    '<>': operator.ne,
-    '~~': sqlops.like_op,
-    '~~*': sqlops.ilike_op,
-    '!~~*': not_(sqlops.ilike_op),
-    '!~~': not_(sqlops.like_op),
-    ('=', True): sqlops.in_op,
-    ('<>', False): not_(sqlops.in_op)
+    "=": operator.eq,
+    "<": operator.lt,
+    ">": operator.gt,
+    "<=": operator.le,
+    ">=": operator.ge,
+    "<>": operator.ne,
+    "~~": sqlops.like_op,
+    "~~*": sqlops.ilike_op,
+    "!~~*": not_(sqlops.ilike_op),
+    "!~~": not_(sqlops.like_op),
+    ("=", True): sqlops.in_op,
+    ("<>", False): not_(sqlops.in_op),
 }
+
 
 def basic_converter(new_type):
     def converter(c):
         old_args = c.type.__dict__
         c.type = new_type()
         c.type.__dict__.update(old_args)
+
     return converter
+
 
 def length_stripper(new_type):
     first = basic_converter(new_type)
+
     def converter(c):
         first(c)
-        c.type.__dict__['length'] = None
+        c.type.__dict__["length"] = None
+
     return converter
+
 
 CONVERSION_MAP = {
     oracle_dialect.NUMBER: basic_converter(NUMERIC),
-
     mssql_dialect.TINYINT: basic_converter(SMALLINT),
     mssql_dialect.NVARCHAR: basic_converter(VARCHAR),
     mssql_dialect.DATETIME: basic_converter(TIMESTAMP),
     mssql_dialect.VARBINARY: basic_converter(BYTEA),
     mssql_dialect.IMAGE: basic_converter(BYTEA),
     mssql_dialect.BIT: basic_converter(BOOLEAN),
-    mssql_dialect.TEXT: length_stripper(TEXT)
+    mssql_dialect.TEXT: length_stripper(TEXT),
 }
 
 SORT_SUPPORT = {
-    'mssql': {'default': 'lower', 'support': False},
-    'postgresql': {'default': 'higher', 'support': True},
-    'mysql': {'default': 'lower', 'support': False},
-    'oracle': {'default': 'higher', 'support': True},
-    'sqlite': {'default': 'lower', 'support': False}
+    "mssql": {"default": "lower", "support": False},
+    "postgresql": {"default": "higher", "support": True},
+    "mysql": {"default": "lower", "support": False},
+    "oracle": {"default": "higher", "support": True},
+    "sqlite": {"default": "lower", "support": False},
 }
 
 
@@ -275,33 +290,36 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
     def __init__(self, fdw_options, fdw_columns):
         super(SqlAlchemyFdw, self).__init__(fdw_options, fdw_columns)
-        if 'tablename' not in fdw_options:
-            log_to_postgres('The tablename parameter is required', ERROR)
+        if "tablename" not in fdw_options:
+            log_to_postgres("The tablename parameter is required", ERROR)
         self.metadata = MetaData()
         url = _parse_url_from_options(fdw_options)
         self.engine = create_engine(url)
-        schema = fdw_options['schema'] if 'schema' in fdw_options else None
-        tablename = fdw_options['tablename']
+        schema = fdw_options["schema"] if "schema" in fdw_options else None
+        tablename = fdw_options["tablename"]
         sqlacols = []
         for col in fdw_columns.values():
             col_type = self._get_column_type(col.type_name)
             sqlacols.append(Column(col.column_name, col_type))
-        self.table = Table(tablename, self.metadata, schema=schema,
-                           *sqlacols)
+
+        self.subquery = fdw_options.get("subquery", None)
+        if self.subquery:
+            self.table = text(self.subquery).columns(*sqlacols)
+        else:
+            self.table = Table(tablename, self.metadata, schema=schema, *sqlacols)
         self.transaction = None
         self._connection = None
-        self._row_id_column = fdw_options.get('primary_key', None)
-
+        self._row_id_column = fdw_options.get("primary_key", None)
 
 
     def _need_explicit_null_ordering(self, key):
         support = SORT_SUPPORT[self.engine.dialect.name]
-        default = support['default']
+        default = support["default"]
         no = None
         if key.is_reversed:
-            no = nullsfirst if default == 'higher' else nullslast
+            no = nullsfirst if default == "higher" else nullslast
         else:
-            no = nullslast if default == 'higher' else nullsfirst
+            no = nullslast if default == "higher" else nullsfirst
         if key.nulls_first:
             if no != nullsfirst:
                 return nullsfirst
@@ -315,9 +333,11 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         if SORT_SUPPORT.get(self.engine.dialect.name) is None:
             # We have no idea about defaults
             return []
-        can_order_null = SORT_SUPPORT[self.engine.dialect.name]['support']
-        if (any((self._need_explicit_null_ordering(x) is not None
-                 for x in sortkeys)) and not can_order_null):
+        can_order_null = SORT_SUPPORT[self.engine.dialect.name]["support"]
+        if (
+            any((self._need_explicit_null_ordering(x) is not None for x in sortkeys))
+            and not can_order_null
+        ):
             return []
         return sortkeys
 
@@ -332,11 +352,9 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         for qual in quals:
             operator = OPERATORS.get(qual.operator, None)
             if operator:
-                clauses.append(operator(self.table.c[qual.field_name],
-                                        qual.value))
+                clauses.append(operator(self.table.c[qual.field_name], qual.value))
             else:
-                log_to_postgres('Qual not pushed to foreign db: %s' % qual,
-                                WARNING)
+                log_to_postgres("Qual not pushed to foreign db: %s" % qual, WARNING)
         if clauses:
             statement = statement.where(and_(*clauses))
         if columns:
@@ -357,7 +375,6 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             statement = statement.order_by(column)
         return statement
 
-
     def execute(self, quals, columns, sortkeys=None):
         """
         The quals are turned into an and'ed where clause.
@@ -365,12 +382,10 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         sortkeys = sortkeys or []
         statement = self._build_statement(quals, columns, sortkeys)
         log_to_postgres(str(statement), DEBUG)
-        rs = (self.connection
-              .execution_options(stream_results=True)
-              .execute(statement))
+        rs = self.connection.execution_options(stream_results=True).execute(statement)
         # Workaround pymssql "trash old results on new query"
         # behaviour (See issue #100)
-        if self.engine.driver == 'pymssql' and self.transaction is not None:
+        if self.engine.driver == "pymssql" and self.transaction is not None:
             rs = list(rs)
 
         for item in rs:
@@ -405,8 +420,9 @@ class SqlAlchemyFdw(ForeignDataWrapper):
     def rowid_column(self):
         if self._row_id_column is None:
             log_to_postgres(
-                'You need to declare a primary key option in order '
-                'to use the write features')
+                "You need to declare a primary key option in order "
+                "to use the write features"
+            )
         return self._row_id_column
 
     def insert(self, values):
@@ -416,65 +432,67 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         self.connection.execute(
             self.table.update()
             .where(self.table.c[self._row_id_column] == rowid)
-            .values(newvalues))
+            .values(newvalues)
+        )
 
     def delete(self, rowid):
         self.connection.execute(
-            self.table.delete()
-            .where(self.table.c[self._row_id_column] == rowid))
+            self.table.delete().where(self.table.c[self._row_id_column] == rowid)
+        )
 
     def _get_column_type(self, format_type):
         """Blatant ripoff from PG_Dialect.get_column_info"""
         # strip (*) from character varying(5), timestamp(5)
         # with time zone, geometry(POLYGON), etc.
-        attype = re.sub(r'\(.*\)', '', format_type)
+        attype = re.sub(r"\(.*\)", "", format_type)
 
         # strip '[]' from integer[], etc.
-        attype = re.sub(r'\[\]', '', attype)
+        attype = re.sub(r"\[\]", "", attype)
 
-        is_array = format_type.endswith('[]')
-        charlen = re.search('\(([\d,]+)\)', format_type)
+        is_array = format_type.endswith("[]")
+        charlen = re.search("\(([\d,]+)\)", format_type)
         if charlen:
             charlen = charlen.group(1)
-        args = re.search('\((.*)\)', format_type)
+        args = re.search("\((.*)\)", format_type)
         if args and args.group(1):
-            args = tuple(re.split('\s*,\s*', args.group(1)))
+            args = tuple(re.split("\s*,\s*", args.group(1)))
         else:
             args = ()
         kwargs = {}
 
-        if attype == 'numeric':
+        if attype == "numeric":
             if charlen:
-                prec, scale = charlen.split(',')
+                prec, scale = charlen.split(",")
                 args = (int(prec), int(scale))
             else:
                 args = ()
-        elif attype == 'double precision':
-            args = (53, )
-        elif attype == 'integer':
+        elif attype == "double precision":
+            args = (53,)
+        elif attype == "integer":
             args = ()
-        elif attype in ('timestamp with time zone',
-                        'time with time zone'):
-            kwargs['timezone'] = True
+        elif attype in ("timestamp with time zone", "time with time zone"):
+            kwargs["timezone"] = True
             if charlen:
-                kwargs['precision'] = int(charlen)
+                kwargs["precision"] = int(charlen)
             args = ()
-        elif attype in ('timestamp without time zone',
-                        'time without time zone', 'time'):
-            kwargs['timezone'] = False
+        elif attype in (
+            "timestamp without time zone",
+            "time without time zone",
+            "time",
+        ):
+            kwargs["timezone"] = False
             if charlen:
-                kwargs['precision'] = int(charlen)
+                kwargs["precision"] = int(charlen)
             args = ()
-        elif attype == 'bit varying':
-            kwargs['varying'] = True
+        elif attype == "bit varying":
+            kwargs["varying"] = True
             if charlen:
                 args = (int(charlen),)
             else:
                 args = ()
-        elif attype in ('interval', 'interval year to month',
-                        'interval day to second'):
+        elif attype in ("interval", "interval year to month", "interval day to second"):
             if charlen:
-                kwargs['precision'] = int(charlen)
+                kwargs["precision"] = int(charlen)
             args = ()
         elif charlen:
             args = (int(charlen),)
@@ -489,8 +507,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         return coltype
 
     @classmethod
-    def import_schema(self, schema, srv_options, options,
-                      restriction_type, restricts):
+    def import_schema(self, schema, srv_options, options, restriction_type, restricts):
         """
         Reflects the remote schema.
         """
@@ -498,21 +515,18 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         url = _parse_url_from_options(srv_options)
         engine = create_engine(url)
         dialect = PGDialect()
-        if restriction_type == 'limit':
+        if restriction_type == "limit":
             only = restricts
-        elif restriction_type == 'except':
+        elif restriction_type == "except":
             only = lambda t, _: t not in restricts
         else:
             only = None
-        metadata.reflect(bind=engine,
-                         schema=schema,
-                         views=True,
-                         only=only)
+        metadata.reflect(bind=engine, schema=schema, views=True, only=only)
         to_import = []
         for _, table in sorted(metadata.tables.items()):
             ftable = TableDefinition(table.name)
-            ftable.options['schema'] = schema
-            ftable.options['tablename'] = table.name
+            ftable.options["schema"] = schema
+            ftable.options["tablename"] = table.name
             for c in table.c:
                 # Force collation to None to prevent imcompatibilities
                 setattr(c.type, "collation", None)
@@ -522,9 +536,13 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                     converter = CONVERSION_MAP[type(c.type)]
                     converter(c)
                 if c.primary_key:
-                    ftable.options['primary_key'] = c.name
-                ftable.columns.append(ColumnDefinition(
-                    c.name,
-                    type_name=c.type.compile(dialect)))
+                    ftable.options["primary_key"] = c.name
+
+                try:
+                    type_name = c.type.compile(dialect)
+                except UnsupportedCompilationError:
+                    type_name = "bytea"
+
+                ftable.columns.append(ColumnDefinition(c.name, type_name=type_name))
             to_import.append(ftable)
         return to_import
