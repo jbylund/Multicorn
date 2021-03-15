@@ -393,15 +393,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         statement = self._build_statement(quals, columns, sortkeys)
         log_to_postgres(str(statement), DEBUG)
 
-        # We can't be sure all dialects support streaming (since that involves using
-        # server-side cursors), so we hack it a bit by sending LIMIT/OFFSET queries.
-
-        offset = 0
-
-        while True:
-            if self.batch_size is not None:
-                statement = statement.limit(self.batch_size).offset(offset)
-
+        if self.connection.dialect.supports_server_side_cursors or self.batch_size is None:
             rs = self.connection.execution_options(stream_results=True).execute(statement)
 
             # Workaround pymssql "trash old results on new query"
@@ -411,12 +403,22 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
             for item in rs:
                 yield dict(item)
+        else:
+            # If a dialect doesn't support streaming using server-side cursor,
+            # we hack it a bit by sending LIMIT/OFFSET queries.
 
-            if not rs:
-                return
-
-            if self.batch_size is not None:
+            offset = 0
+            while True:
+                statement = statement.limit(self.batch_size).offset(offset)
                 offset += self.batch_size
+
+                rs = self.connection.execution_options(stream_results=True).execute(statement)
+                if self.engine.driver == "pymssql" and self.transaction is not None:
+                    rs = list(rs)
+                for item in rs:
+                    yield dict(item)
+                if not rs:
+                    return
 
     @property
     def connection(self):
