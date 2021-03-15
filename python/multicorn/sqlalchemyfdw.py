@@ -149,6 +149,8 @@ such as pymysql):
   );
 
 """
+import logging
+
 from sqlalchemy import create_engine, alias, subquery
 from sqlalchemy.engine.url import make_url, URL
 from sqlalchemy.exc import UnsupportedCompilationError
@@ -271,6 +273,7 @@ SORT_SUPPORT = {
     "mysql": {"default": "lower", "support": False},
     "oracle": {"default": "higher", "support": True},
     "sqlite": {"default": "lower", "support": False},
+    "snowflake": {"default": "higher", "support": True},
 }
 
 
@@ -290,6 +293,12 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
     def __init__(self, fdw_options, fdw_columns):
         super(SqlAlchemyFdw, self).__init__(fdw_options, fdw_columns)
+
+        logging.basicConfig(
+            format="%(asctime)s [%(process)d] %(levelname)s %(message)s",
+            level="INFO",
+        )
+
         if "tablename" not in fdw_options:
             log_to_postgres("The tablename parameter is required", ERROR)
         self.metadata = MetaData()
@@ -311,6 +320,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         self._connection = None
         self._row_id_column = fdw_options.get("primary_key", None)
 
+        self.batch_size = fdw_options.get("batch_size", 1000)
 
     def _need_explicit_null_ordering(self, key):
         support = SORT_SUPPORT[self.engine.dialect.name]
@@ -362,7 +372,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         else:
             columns = self.table.c
         statement = statement.with_only_columns(columns)
-        orders = []
+
         for sortkey in sortkeys:
             column = self.table.c[sortkey.attname]
             if sortkey.is_reversed:
@@ -382,14 +392,31 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         sortkeys = sortkeys or []
         statement = self._build_statement(quals, columns, sortkeys)
         log_to_postgres(str(statement), DEBUG)
-        rs = self.connection.execution_options(stream_results=True).execute(statement)
-        # Workaround pymssql "trash old results on new query"
-        # behaviour (See issue #100)
-        if self.engine.driver == "pymssql" and self.transaction is not None:
-            rs = list(rs)
 
-        for item in rs:
-            yield dict(item)
+        # We can't be sure all dialects support streaming (since that involves using
+        # server-side cursors), so we hack it a bit by sending LIMIT/OFFSET queries.
+
+        offset = 0
+
+        while True:
+            if self.batch_size is not None:
+                statement = statement.limit(self.batch_size).offset(offset)
+
+            rs = self.connection.execution_options(stream_results=True).execute(statement)
+
+            # Workaround pymssql "trash old results on new query"
+            # behaviour (See issue #100)
+            if self.engine.driver == "pymssql" and self.transaction is not None:
+                rs = list(rs)
+
+            for item in rs:
+                yield dict(item)
+
+            if not rs:
+                return
+
+            if self.batch_size is not None:
+                offset += self.batch_size
 
     @property
     def connection(self):
