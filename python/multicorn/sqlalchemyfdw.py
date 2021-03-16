@@ -313,7 +313,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
         self.subquery = fdw_options.get("subquery", None)
         if self.subquery:
-            self.table = text(self.subquery).columns(*sqlacols)
+            self.table = text(self.subquery).columns(*sqlacols).subquery(name=tablename)
         else:
             self.table = Table(tablename, self.metadata, schema=schema, *sqlacols)
         self.transaction = None
@@ -406,7 +406,9 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                 statement = statement.limit(self.batch_size).offset(offset)
                 offset += self.batch_size
 
-            rs = self.connection.execution_options(stream_results=True).execute(statement)
+            rs = self.connection.execution_options(stream_results=True).execute(
+                statement
+            )
 
             # Workaround pymssql "trash old results on new query"
             # behaviour (See issue #100)
