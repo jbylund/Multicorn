@@ -412,9 +412,11 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             # behaviour (See issue #100)
             if self.engine.driver == "pymssql" and self.transaction is not None:
                 rs = list(rs)
+            returned = 0
             for item in rs:
                 yield dict(item)
-            if not rs:
+                returned += 1
+            if self.batch_size is None or returned < self.batch_size:
                 return
 
     @property
