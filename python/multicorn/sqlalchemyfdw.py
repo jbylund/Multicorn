@@ -369,8 +369,13 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             statement = statement.where(and_(*clauses))
         if columns:
             columns = [self.table.c[col] for col in columns]
+        elif columns is None:
+            columns = [self.table]
         else:
-            columns = self.table.c
+            # This is the case where we're asked to output no columns (just a list of empty dicts)
+            # in a SELECT 1, but I can't get SQLAlchemy to emit `SELECT 1 FROM some_table`, so
+            # we just select a single column.
+            columns = [self.table.c[list(self.table.c)[0].name]]
         statement = statement.with_only_columns(columns)
 
         for sortkey in sortkeys:
