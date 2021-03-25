@@ -149,7 +149,9 @@ such as pymysql):
   );
 
 """
+import json
 import logging
+import os
 
 from sqlalchemy import create_engine, alias, subquery
 from sqlalchemy.engine.url import make_url, URL
@@ -321,6 +323,9 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         self._row_id_column = fdw_options.get("primary_key", None)
 
         self.batch_size = fdw_options.get("batch_size", 10000)
+        self.envvars = json.loads(fdw_options.get("envvars", "{}"))
+        if self.envvars:
+            os.environ.update(self.envvars)
 
     def _need_explicit_null_ordering(self, key):
         support = SORT_SUPPORT[self.engine.dialect.name]
@@ -541,8 +546,18 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         """
         Reflects the remote schema.
         """
+        logging.basicConfig(
+            format="%(asctime)s [%(process)d] %(levelname)s %(message)s",
+            level="INFO",
+        )
+
         metadata = MetaData()
         url = _parse_url_from_options(srv_options)
+
+        envvars = json.loads(srv_options.get("envvars", "{}"))
+        if envvars:
+            os.environ.update(envvars)
+
         engine = create_engine(url)
         dialect = PGDialect()
         if restriction_type == "limit":
