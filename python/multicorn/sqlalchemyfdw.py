@@ -280,8 +280,16 @@ SORT_SUPPORT = {
 }
 
 
+# List of allowed environment variables to switch (connection-related)
+# so that the users don't get too crazy with this.
+_ALLOWED_ENVVARS = ["HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY"]
+
+
 @contextmanager
 def inject_envvars(envvars):
+    for v in envvars:
+        if v not in _ALLOWED_ENVVARS:
+            raise ValueError("Environment variable %s not allowed!" % v)
     _envvars = os.environ.copy()
     try:
         os.environ.update(envvars)
