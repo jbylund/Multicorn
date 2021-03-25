@@ -152,6 +152,7 @@ such as pymysql):
 import json
 import logging
 import os
+from contextlib import contextmanager
 
 from sqlalchemy import create_engine, alias, subquery
 from sqlalchemy.engine.url import make_url, URL
@@ -279,6 +280,16 @@ SORT_SUPPORT = {
 }
 
 
+@contextmanager
+def inject_envvars(envvars):
+    _envvars = os.environ.copy()
+    try:
+        os.environ.update(envvars)
+        yield
+    finally:
+        os.environ.update(_envvars)
+
+
 class SqlAlchemyFdw(ForeignDataWrapper):
     """An SqlAlchemy foreign data wrapper.
 
@@ -324,8 +335,6 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
         self.batch_size = fdw_options.get("batch_size", 10000)
         self.envvars = json.loads(fdw_options.get("envvars", "{}"))
-        if self.envvars:
-            os.environ.update(self.envvars)
 
     def _need_explicit_null_ordering(self, key):
         support = SORT_SUPPORT[self.engine.dialect.name]
@@ -406,25 +415,26 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         # If a dialect doesn't support streaming using server-side cursors,
         # we hack it a bit by sending LIMIT/OFFSET queries.
         offset = 0
-        while True:
-            if self.batch_size is not None:
-                statement = statement.limit(self.batch_size).offset(offset)
-                offset += self.batch_size
+        with inject_envvars(self.envvars):
+            while True:
+                if self.batch_size is not None:
+                    statement = statement.limit(self.batch_size).offset(offset)
+                    offset += self.batch_size
 
-            rs = self.connection.execution_options(stream_results=True).execute(
-                statement
-            )
+                rs = self.connection.execution_options(stream_results=True).execute(
+                    statement
+                )
 
-            # Workaround pymssql "trash old results on new query"
-            # behaviour (See issue #100)
-            if self.engine.driver == "pymssql" and self.transaction is not None:
-                rs = list(rs)
-            returned = 0
-            for item in rs:
-                yield dict(item)
-                returned += 1
-            if self.batch_size is None or returned < self.batch_size:
-                return
+                # Workaround pymssql "trash old results on new query"
+                # behaviour (See issue #100)
+                if self.engine.driver == "pymssql" and self.transaction is not None:
+                    rs = list(rs)
+                returned = 0
+                for item in rs:
+                    yield dict(item)
+                    returned += 1
+                if self.batch_size is None or returned < self.batch_size:
+                    return
 
     @property
     def connection(self):
@@ -551,13 +561,16 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             level="INFO",
         )
 
-        metadata = MetaData()
         url = _parse_url_from_options(srv_options)
 
         envvars = json.loads(srv_options.get("envvars", "{}"))
-        if envvars:
-            os.environ.update(envvars)
 
+        with inject_envvars(envvars):
+            to_import = self._import_schema(url, schema, restriction_type, restricts)
+        return to_import
+
+    @classmethod
+    def _import_schema(cls, url, schema, restriction_type, restricts):
         engine = create_engine(url)
         dialect = PGDialect()
         if restriction_type == "limit":
@@ -566,6 +579,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             only = lambda t, _: t not in restricts
         else:
             only = None
+        metadata = MetaData()
         metadata.reflect(bind=engine, schema=schema, views=True, only=only)
         to_import = []
         for _, table in sorted(metadata.tables.items()):
