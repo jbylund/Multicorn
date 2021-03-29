@@ -154,7 +154,7 @@ import logging
 import os
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, alias, subquery
+from sqlalchemy import create_engine
 from sqlalchemy.engine.url import make_url, URL
 from sqlalchemy.exc import UnsupportedCompilationError
 from sqlalchemy.sql import select, operators as sqlops, and_
@@ -309,7 +309,9 @@ class SqlAlchemyFdw(ForeignDataWrapper):
     db_url      --  the sqlalchemy connection string.
     schema      --  (optional) schema name to qualify table name with
     tablename   --  the table name in the remote database.
-
+    envvars     --  (optional) JSON dictionary of environment variables
+                    to set during the execution.
+    subquery    --  (optional) Subquery to evaluate on the remote side.
     """
 
     def __init__(self, fdw_options, fdw_columns):
