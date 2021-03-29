@@ -149,10 +149,12 @@ such as pymysql):
   );
 
 """
+import base64
 import json
 import logging
 import os
 from contextlib import contextmanager
+from typing import Optional
 
 from sqlalchemy import create_engine
 from sqlalchemy.engine.url import make_url, URL
@@ -298,6 +300,15 @@ def inject_envvars(envvars):
         os.environ.update(_envvars)
 
 
+def _load_connect_args(connect_args_str: Optional[str]):
+    # Hack for Snowflake requiring bytes for privkey and us not being able
+    # to encode these over JSON.
+    connect_args = json.loads(connect_args_str or "{}")
+    if "private_key" in connect_args:
+        connect_args["private_key"] = base64.b64decode(connect_args["private_key"])
+    return connect_args
+
+
 class SqlAlchemyFdw(ForeignDataWrapper):
     """An SqlAlchemy foreign data wrapper.
 
@@ -311,6 +322,8 @@ class SqlAlchemyFdw(ForeignDataWrapper):
     tablename   --  the table name in the remote database.
     envvars     --  (optional) JSON dictionary of environment variables
                     to set during the execution.
+    connect_args--  (optional) JSON dictionary of parameters to pass as
+                    connect_args to the engine.
     subquery    --  (optional) Subquery to evaluate on the remote side.
     """
 
@@ -326,7 +339,11 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             log_to_postgres("The tablename parameter is required", ERROR)
         self.metadata = MetaData()
         url = _parse_url_from_options(fdw_options)
-        self.engine = create_engine(url)
+
+        self.connect_args = _load_connect_args(fdw_options.get("connect_args"))
+
+        self.engine = create_engine(url, connect_args=self.connect_args)
+
         schema = fdw_options["schema"] if "schema" in fdw_options else None
         tablename = fdw_options["tablename"]
         sqlacols = []
@@ -574,14 +591,19 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         url = _parse_url_from_options(srv_options)
 
         envvars = json.loads(srv_options.get("envvars", "{}"))
+        connect_args = _load_connect_args(srv_options.get("connect_args")) or None
 
         with inject_envvars(envvars):
-            to_import = self._import_schema(url, schema, restriction_type, restricts)
+            to_import = self._import_schema(
+                url, schema, restriction_type, restricts, connect_args
+            )
         return to_import
 
     @classmethod
-    def _import_schema(cls, url, schema, restriction_type, restricts):
-        engine = create_engine(url)
+    def _import_schema(
+        cls, url, schema, restriction_type, restricts, connect_args=None
+    ):
+        engine = create_engine(url, connect_args=connect_args)
         dialect = PGDialect()
         if restriction_type == "limit":
             only = restricts
