@@ -309,6 +309,15 @@ def _load_connect_args(connect_args_str: Optional[str]):
     return connect_args
 
 
+def _create_engine(url, connect_args=None):
+    """Wrapper around connect_args that doesn't pass it in if it's not set"""
+    kwargs = {}
+    if connect_args:
+        kwargs["connect_args"] = connect_args
+    engine = create_engine(url, **kwargs)
+    return engine
+
+
 class SqlAlchemyFdw(ForeignDataWrapper):
     """An SqlAlchemy foreign data wrapper.
 
@@ -342,7 +351,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
         self.connect_args = _load_connect_args(fdw_options.get("connect_args"))
 
-        self.engine = create_engine(url, connect_args=self.connect_args)
+        self.engine = _create_engine(url, self.connect_args)
 
         schema = fdw_options["schema"] if "schema" in fdw_options else None
         tablename = fdw_options["tablename"]
@@ -603,7 +612,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
     def _import_schema(
         cls, url, schema, restriction_type, restricts, connect_args=None
     ):
-        engine = create_engine(url, connect_args=connect_args)
+        engine = _create_engine(url, connect_args)
         dialect = PGDialect()
         if restriction_type == "limit":
             only = restricts
