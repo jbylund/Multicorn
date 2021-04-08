@@ -369,7 +369,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         self._connection = None
         self._row_id_column = fdw_options.get("primary_key", None)
 
-        self.batch_size = fdw_options.get("batch_size", 10000)
+        self.batch_size = int(fdw_options.get("batch_size", 10000))
         self.envvars = json.loads(fdw_options.get("envvars", "{}"))
 
     def _need_explicit_null_ordering(self, key):
