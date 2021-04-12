@@ -323,13 +323,13 @@ getOptions(Oid foreigntableid)
 	f_server = GetForeignServer(f_table->serverid);
 
 	options = NIL;
-	options = list_concat(options, f_table->options);
-	options = list_concat(options, f_server->options);
 	/* An error might occur if no user mapping is defined. */
 	/* In that case, just ignore it */
 	mapping = multicorn_GetUserMapping(GetUserId(), f_table->serverid);
 	if (mapping)
 		options = list_concat(options, mapping->options);
+	options = list_concat(options, f_server->options);
+	options = list_concat(options, f_table->options);
 	return options;
 }
 
