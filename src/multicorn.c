@@ -111,6 +111,8 @@ static void multicorn_subxact_callback(SubXactEvent event, SubTransactionId mySu
 #if PG_VERSION_NUM >= 90500
 static List *multicornImportForeignSchema(ImportForeignSchemaStmt * stmt,
 							 Oid serverOid);
+static bool multicornIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
+											RangeTblEntry *rte);
 #endif
 
 static void multicorn_xact_callback(XactEvent event, void *arg);
@@ -218,6 +220,7 @@ multicorn_handler(PG_FUNCTION_ARGS)
 
 #if PG_VERSION_NUM >= 90500
 	fdw_routine->ImportForeignSchema = multicornImportForeignSchema;
+	fdw_routine->IsForeignScanParallelSafe = multicornIsForeignScanParallelSafe;
 #endif
 
 	PG_RETURN_POINTER(fdw_routine);
@@ -1440,6 +1443,13 @@ multicornImportForeignSchema(ImportForeignSchemaStmt * stmt,
 	Py_DECREF(p_iter);
 	Py_DECREF(p_tables);
 	return cmds;
+}
+
+static bool
+multicornIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
+								RangeTblEntry *rte)
+{
+	return true;
 }
 #endif
 
