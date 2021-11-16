@@ -223,6 +223,9 @@ multicorn_handler(PG_FUNCTION_ARGS)
 	fdw_routine->IsForeignScanParallelSafe = multicornIsForeignScanParallelSafe;
 #endif
 
+    /* Support functions for upper relation push-down */
+	fdwroutine->GetForeignUpperPaths = multicornGetForeignUpperPaths;
+
 	PG_RETURN_POINTER(fdw_routine);
 }
 
@@ -353,7 +356,7 @@ multicornGetForeignRelSize(PlannerInfo *root,
 			}
 		}
 	}
-	
+
 	/* Extract the restrictions from the plan. */
 	foreach(lc, baserel->baserestrictinfo)
 	{
@@ -707,7 +710,7 @@ static List *buildCStoreQualList(AttrNumber *attrMap, int map_length, List *qual
 	return result;
 }
 
-/* 
+/*
  * Debug functions to print TupleDesc structs (stolen from private PG),
  * not currently used anywhere.
  */
@@ -728,7 +731,7 @@ static void print_desc(TupleDesc desc)
 {
 	int         i;
 	for (i = 0; i < desc->natts; ++i)
-	{ 
+	{
 		printatt((unsigned) i + 1, TupleDescAttr(desc, i));
 	}
 }
@@ -812,8 +815,8 @@ multicornIterateForeignScan(ForeignScanState *node)
 	MulticornExecState *execstate = node->fdw_state;
 	PyObject   *p_value;
 	MemoryContext oldcontext;
-	
-	/* The data flow here is kind of complex: we treat strings returned by 
+
+	/* The data flow here is kind of complex: we treat strings returned by
 	 * Python as relation names to read data from directly instead of getting Python
 	 * to return it to us.
 	 *
@@ -825,9 +828,9 @@ multicornIterateForeignScan(ForeignScanState *node)
 	 * expects the relations to actually exist at query plan time -- for example,
 	 * CStore's read planner needs the table's RangeTblEntry to be present in the
 	 * planner's simple_rte_array, which we don't want to modify at query execution time.
-	 * 
+	 *
 	 */
-	
+
 	ExecClearTuple(slot);
 	while (1)
 	{
@@ -902,7 +905,7 @@ multicornIterateForeignScan(ForeignScanState *node)
 
 			char	   *relation;
 			Py_ssize_t	strlength = 0;
-			
+
 			if (PyString_AsStringAndSize(p_value, &relation, &strlength) < 0)
 			{
 				elog(ERROR, "Could not convert subrelation to string!");
@@ -1452,6 +1455,397 @@ multicornIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
 	return true;
 }
 #endif
+
+
+/*
+ * Assess whether the aggregation, grouping and having operations can be pushed
+ * down to the foreign server.  As a side effect, save information we obtain in
+ * this function to MulticornFdwRelationInfo of the input relation.
+ */
+static bool
+multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+                              Node *havingQual)
+{
+	Query	   *query = root->parse;
+	MulticornFdwRelationInfo *fpinfo = (MulticornFdwRelationInfo *) grouped_rel->fdw_private;
+    PathTarget *grouping_target = grouped_rel->reltarget;
+    // Or perhaps like in SQLite FDW `PathTarget *grouping_target = root->upper_targets[UPPERREL_GROUP_AGG];`?
+	MulticornFdwRelationInfo *ofpinfo;
+	List	   *aggvars;
+	ListCell   *lc;
+	int			i;
+	List	   *tlist = NIL;
+
+	/* We currently don't support pushing Grouping Sets. */
+	if (query->groupingSets)
+		return false;
+
+	/* Get the fpinfo of the underlying scan relation. */
+	ofpinfo = (MulticornFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+
+	/*
+	 * If underlying scan relation has any local conditions, those conditions
+	 * are required to be applied before performing aggregation.  Hence the
+	 * aggregate cannot be pushed down.
+	 */
+	if (ofpinfo->local_conds)
+		return false;
+
+    /*
+	 * Examine grouping expressions, as well as other expressions we'd need to
+	 * compute, and check whether they are safe to push down to the foreign
+	 * server.  All GROUP BY expressions will be part of the grouping target
+	 * and thus there is no need to search for them separately.  Add grouping
+	 * expressions into target list which will be passed to foreign server.
+	 */
+	i = 0;
+	foreach(lc, grouping_target->exprs)
+	{
+		Expr	   *expr = (Expr *) lfirst(lc);
+		Index		sgref = get_pathtarget_sortgroupref(grouping_target, i);
+		ListCell   *l;
+
+		/* Check whether this expression is part of GROUP BY clause */
+		if (sgref && get_sortgroupref_clause_noerr(sgref, query->groupClause))
+		{
+			TargetEntry *tle;
+
+			/*
+			 * If any of the GROUP BY expression is not shippable we can not
+			 * push down aggregation to the foreign server.
+			 */
+			if (!multicorn_is_foreign_expr(root, grouped_rel, expr))
+				return false;
+
+			/*
+			 * If it would be a foreign param, we can't put it into the tlist,
+			 * so we have to fail.
+			 */
+			if (multicorn_is_foreign_param(root, grouped_rel, expr))
+				return false;
+
+			/*
+			 * Pushable, so add to tlist.  We need to create a TLE for this
+			 * expression and apply the sortgroupref to it.  We cannot use
+			 * add_to_flat_tlist() here because that avoids making duplicate
+			 * entries in the tlist.  If there are duplicate entries with
+			 * distinct sortgrouprefs, we have to duplicate that situation in
+			 * the output tlist.
+			 */
+			tle = makeTargetEntry(expr, list_length(tlist) + 1, NULL, false);
+			tle->ressortgroupref = sgref;
+			tlist = lappend(tlist, tle);
+		}
+		else
+		{
+			/* Check entire expression whether it is pushable or not */
+			if (sqlite_is_foreign_expr(root, grouped_rel, expr) &&
+				!sqlite_is_foreign_param(root, grouped_rel, expr))
+			{
+				/* Pushable, add to tlist */
+				tlist = add_to_flat_tlist(tlist, list_make1(expr));
+			}
+			else
+			{
+				/* Not matched exactly, pull the var with aggregates then */
+				aggvars = pull_var_clause((Node *) expr,
+										  PVC_INCLUDE_AGGREGATES);
+
+				if (!sqlite_is_foreign_expr(root, grouped_rel, (Expr *) aggvars))
+					return false;
+
+				/*
+				 * Add aggregates, if any, into the targetlist.  Plain var
+				 * nodes should be either same as some GROUP BY expression or
+				 * part of some GROUP BY expression. In later case, the query
+				 * cannot refer plain var nodes without the surrounding
+				 * expression.  In both the cases, they are already part of
+				 * the targetlist and thus no need to add them again.  In fact
+				 * adding pulled plain var nodes in SELECT clause will cause
+				 * an error on the foreign server if they are not same as some
+				 * GROUP BY expression.
+				 */
+				foreach(l, aggvars)
+				{
+					Expr	   *expr = (Expr *) lfirst(l);
+
+					if (IsA(expr, Aggref))
+						tlist = add_to_flat_tlist(tlist, list_make1(expr));
+				}
+			}
+		}
+
+		i++;
+	}
+
+	/*
+	 * Classify the pushable and non-pushable having clauses and save them in
+	 * remote_conds and local_conds of the grouped rel's fpinfo.
+	 */
+	if (root->hasHavingQual && query->havingQual)
+	{
+		ListCell   *lc;
+
+		foreach(lc, (List *) query->havingQual)
+		{
+			Expr	   *expr = (Expr *) lfirst(lc);
+			RestrictInfo *rinfo;
+
+			/*
+			 * Currently, the core code doesn't wrap havingQuals in
+			 * RestrictInfos, so we must make our own.
+			 */
+			Assert(!IsA(expr, RestrictInfo));
+
+#if (PG_VERSION_NUM >= 100000)
+			rinfo = make_restrictinfo(
+#if PG_VERSION_NUM >= 140000
+									  root,
+#endif
+									  expr,
+									  true,
+									  false,
+									  false,
+									  root->qual_security_level,
+									  grouped_rel->relids,
+									  NULL,
+									  NULL);
+#else
+			rinfo = make_simple_restrictinfo(expr);
+#endif
+			if (sqlite_is_foreign_expr(root, grouped_rel, expr))
+				fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
+			else
+				fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
+
+		}
+	}
+
+	/*
+	 * If there are any local conditions, pull Vars and aggregates from it and
+	 * check whether they are safe to pushdown or not.
+	 */
+	if (fpinfo->local_conds)
+	{
+		List	   *aggvars = NIL;
+		ListCell   *lc;
+
+		foreach(lc, fpinfo->local_conds)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+			aggvars = list_concat(aggvars,
+								  pull_var_clause((Node *) rinfo->clause,
+												  PVC_INCLUDE_AGGREGATES));
+		}
+
+		foreach(lc, aggvars)
+		{
+			Expr	   *expr = (Expr *) lfirst(lc);
+
+			/*
+			 * If aggregates within local conditions are not safe to push
+			 * down, then we cannot push down the query.  Vars are already
+			 * part of GROUP BY clause which are checked above, so no need to
+			 * access them again here.
+			 */
+			if (IsA(expr, Aggref))
+			{
+				if (!sqlite_is_foreign_expr(root, grouped_rel, expr))
+					return false;
+
+				tlist = add_to_flat_tlist(tlist, list_make1(expr));
+			}
+		}
+	}
+
+
+	/* Store generated targetlist */
+	fpinfo->grouped_tlist = tlist;
+
+	/* Safe to pushdown */
+	fpinfo->pushdown_safe = true;
+
+	/*
+	 * If user is willing to estimate cost for a scan using EXPLAIN, he
+	 * intends to estimate scans on that relation more accurately. Then, it
+	 * makes sense to estimate the cost of the grouping on that relation more
+	 * accurately using EXPLAIN.
+	 */
+	fpinfo->use_remote_estimate = ofpinfo->use_remote_estimate;
+
+	/* Copy startup and tuple cost as is from underneath input rel's fpinfo */
+	fpinfo->fdw_startup_cost = ofpinfo->fdw_startup_cost;
+	fpinfo->fdw_tuple_cost = ofpinfo->fdw_tuple_cost;
+
+	/*
+	 * Set cached relation costs to some negative value, so that we can detect
+	 * when they are set to some sensible costs, during one (usually the
+	 * first) of the calls to sqlite_estimate_path_cost_size().
+	 */
+	fpinfo->rel_startup_cost = -1;
+	fpinfo->rel_total_cost = -1;
+
+
+	/*
+	 * Set the string describing this grouped relation to be used in EXPLAIN
+	 * output of corresponding ForeignScan.
+	 */
+	fpinfo->relation_name = NULL;
+
+	return true;
+}
+
+
+/*
+ * multicornGetForeignUpperPaths
+ *		Add paths for post-join operations like aggregation, grouping etc. if
+ *		corresponding operations are safe to push down.
+ *
+ * Right now, we only support aggregate, grouping and having clause pushdown.
+ */
+static void
+multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
+						      RelOptInfo *input_rel, RelOptInfo *output_rel
+#if (PG_VERSION_NUM >= 110000)
+						      ,void *extra
+#endif
+)
+{
+	MulticornFdwRelationInfo *fpinfo;
+
+	debug_elog(DEBUG1, "multicorn_fdw : %s", __func__);
+
+	/*
+	 * If input rel is not safe to pushdown, then simply return as we cannot
+	 * perform any post-join operations on the foreign server.
+	 */
+	if (!input_rel->fdw_private ||
+		!((MulticornFdwRelationInfo *) input_rel->fdw_private)->pushdown_safe)
+		return;
+
+	/* Ignore stages we don't support; and skip any duplicate calls. */
+	if ((stage != UPPERREL_GROUP_AGG &&
+		 stage != UPPERREL_ORDERED &&
+		 stage != UPPERREL_FINAL) ||
+		output_rel->fdw_private)
+		return;
+
+	fpinfo = (MulticornFdwRelationInfo *) palloc0(sizeof(MulticornFdwRelationInfo));
+	fpinfo->pushdown_safe = false;
+	fpinfo->stage = stage;
+	output_rel->fdw_private = fpinfo;
+
+	switch (stage)
+	{
+		case UPPERREL_GROUP_AGG:
+			multicorn_add_foreign_grouping_paths(root, input_rel, output_rel
+#if (PG_VERSION_NUM >= 110000)
+											  ,(GroupPathExtraData *) extra
+#endif
+				);
+			break;
+// 		case UPPERREL_ORDERED:
+// 			multicorn_add_foreign_ordered_paths(root, input_rel, output_rel);
+// 			break;
+// 		case UPPERREL_FINAL:
+// 			multicorn_add_foreign_final_paths(root, input_rel, output_rel
+// #if (PG_VERSION_NUM >= 120000)
+// 										   ,(FinalPathExtraData *) extra
+// #endif
+// 				);
+// 			break;
+		default:
+			debug_elog(ERROR, "unexpected upper relation: %d", (int) stage);
+			break;
+	}
+}
+
+/*
+ * multicorn_add_foreign_grouping_paths
+ *		Add foreign path for grouping and/or aggregation.
+ *
+ * Given input_rel represents the underlying scan.  The paths are added to the
+ * given grouped_rel.
+ */
+static void
+multicorn_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
+								     RelOptInfo *grouped_rel
+#if (PG_VERSION_NUM >= 110000)
+								  ,GroupPathExtraData *extra
+#endif
+)
+{
+	Query	   *parse = root->parse;
+	MulticornFdwRelationInfo *ifpinfo = input_rel->fdw_private;
+	MulticornFdwRelationInfo *fpinfo = grouped_rel->fdw_private;
+	ForeignPath *grouppath;
+	double		rows;
+	int			width;
+	Cost		startup_cost;
+	Cost		total_cost;
+
+	/* Nothing to be done, if there is no grouping or aggregation required. */
+	if (!parse->groupClause && !parse->groupingSets && !parse->hasAggs &&
+		!root->hasHavingQual)
+		return;
+
+#if (PG_VERSION_NUM >= 110000)
+	Assert(extra->patype == PARTITIONWISE_AGGREGATE_NONE ||
+		   extra->patype == PARTITIONWISE_AGGREGATE_FULL);
+#endif
+
+	/* save the input_rel as outerrel in fpinfo */
+	fpinfo->outerrel = input_rel;
+
+	/*
+	 * Copy foreign table, foreign server, user mapping, shippable extensions
+	 * etc. details from the input relation's fpinfo.
+	 */
+	fpinfo->table = ifpinfo->table;
+	fpinfo->server = ifpinfo->server;
+
+	fpinfo->shippable_extensions = ifpinfo->shippable_extensions;
+
+	/* Assess if it is safe to push down aggregation and grouping. */
+	if (!multicorn_foreign_grouping_ok(root, grouped_rel))
+		return;
+
+	/* Use small cost to push down aggregate always */
+	rows = width = startup_cost = total_cost = 1;
+	/* Now update this information in the fpinfo */
+	fpinfo->rows = rows;
+	fpinfo->width = width;
+	fpinfo->startup_cost = startup_cost;
+	fpinfo->total_cost = total_cost;
+
+	/* Create and add foreign path to the grouping relation. */
+#if (PG_VERSION_NUM >= 120000)
+	grouppath = create_foreign_upper_path(root,
+										  grouped_rel,
+										  grouped_rel->reltarget,
+										  rows,
+										  startup_cost,
+										  total_cost,
+										  NIL,	/* no pathkeys */
+										  NULL,
+										  NIL); /* no fdw_private */
+#else
+	grouppath = create_foreignscan_path(root,
+										grouped_rel,
+										root->upper_targets[UPPERREL_GROUP_AGG],
+										rows,
+										startup_cost,
+										total_cost,
+										NIL,	/* no pathkeys */
+										NULL,	/* no required_outer */
+										NULL,
+										NIL);	/* no fdw_private */
+#endif
+
+	/* Add generated path into grouped_rel by add_path(). */
+	add_path(grouped_rel, (Path *) grouppath);
+}
 
 
 /*
