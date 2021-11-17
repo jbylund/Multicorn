@@ -1539,8 +1539,8 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 		else
 		{
 			/* Check entire expression whether it is pushable or not */
-			if (sqlite_is_foreign_expr(root, grouped_rel, expr) &&
-				!sqlite_is_foreign_param(root, grouped_rel, expr))
+			if (multicorn_is_foreign_expr(root, grouped_rel, expr) &&
+				!multicorn_is_foreign_param(root, grouped_rel, expr))
 			{
 				/* Pushable, add to tlist */
 				tlist = add_to_flat_tlist(tlist, list_make1(expr));
@@ -1551,7 +1551,7 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 				aggvars = pull_var_clause((Node *) expr,
 										  PVC_INCLUDE_AGGREGATES);
 
-				if (!sqlite_is_foreign_expr(root, grouped_rel, (Expr *) aggvars))
+				if (!multicorn_is_foreign_expr(root, grouped_rel, (Expr *) aggvars))
 					return false;
 
 				/*
@@ -1613,7 +1613,7 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 #else
 			rinfo = make_simple_restrictinfo(expr);
 #endif
-			if (sqlite_is_foreign_expr(root, grouped_rel, expr))
+			if (multicorn_is_foreign_expr(root, grouped_rel, expr))
 				fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
 			else
 				fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
@@ -1651,7 +1651,7 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 			 */
 			if (IsA(expr, Aggref))
 			{
-				if (!sqlite_is_foreign_expr(root, grouped_rel, expr))
+				if (!multicorn_is_foreign_expr(root, grouped_rel, expr))
 					return false;
 
 				tlist = add_to_flat_tlist(tlist, list_make1(expr));
@@ -1681,7 +1681,7 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	/*
 	 * Set cached relation costs to some negative value, so that we can detect
 	 * when they are set to some sensible costs, during one (usually the
-	 * first) of the calls to sqlite_estimate_path_cost_size().
+	 * first) of the calls to multicorn_estimate_path_cost_size().
 	 */
 	fpinfo->rel_startup_cost = -1;
 	fpinfo->rel_total_cost = -1;

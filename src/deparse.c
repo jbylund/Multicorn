@@ -66,7 +66,7 @@ multicorn_is_foreign_expr(PlannerInfo *root,
 		glob_cxt.relids = baserel->relids;
 	loc_cxt.collation = InvalidOid;
 	loc_cxt.state = FDW_COLLATE_NONE;
-	if (!sqlite_foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
+	if (!multicorn_foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
 		return false;
 
 	/*
@@ -417,18 +417,7 @@ multicorn_foreign_expr_walker(Node *node,
 				if (schema != PG_CATALOG_NAMESPACE)
 					return false;
 
-				/*
-				 * These function can be passed to SQLite. In case of nest
-				 * functions, for example, (round(abs(c1), 0) = 1, the
-				 * postgres core will transform to
-				 * (round((abs(t1.c1))::numeric, 0) = '1'::numeric), so
-				 * "::numberic" is kind of function format
-				 * COERCE_IMPLICIT_CAST we must check.
-				 *
-				 * In SQLite, lower/upper function does not support UNICODE
-				 * character, so we don't push down these functions.
-				 *
-				 */
+				/* TODO: forward this decision into Python */
 				if (!(func->funcformat == COERCE_IMPLICIT_CAST
 					  || strcmp(opername, "abs") == 0
 					  || strcmp(opername, "btrim") == 0
@@ -483,6 +472,7 @@ multicorn_foreign_expr_walker(Node *node,
 
 				/*
 				 * Join-pushdown allows only a few operators to be pushed down.
+                 * TODO: forward this decision into Python
 				 */
 				if (glob_cxt->is_remote_cond &&
 					(!(strcmp(operatorName, "<") == 0 ||
@@ -556,17 +546,14 @@ multicorn_foreign_expr_walker(Node *node,
 				cur_opname = pstrdup(NameStr(form->oprname));
 				ReleaseSysCache(tuple);
 
-				/*
-				 * Factorial (!) and Bitwise XOR (^) cannot be pushed down to
-				 * SQLite
-				 */
+				/* TODO: forward this decision into Python */
 				if (strcmp(cur_opname, "!") == 0
 					|| strcmp(cur_opname, "^") == 0)
 				{
 					return false;
 				}
 
-				/* ILIKE cannot be pushed down to SQLite */
+				/* TODO: forward this decision into Python */
 				if (strcmp(cur_opname, "~~*") == 0 || strcmp(cur_opname, "!~~*") == 0)
 				{
 					return false;
