@@ -1,6 +1,6 @@
 srcdir       = .
 MODULE_big   = multicorn
-OBJS         =  src/errors.o src/python.o src/query.o src/multicorn.o
+OBJS         = src/deparse.o src/errors.o src/python.o src/query.o src/multicorn.o
 
 
 DATA         = $(filter-out $(wildcard sql/*--*.sql),$(wildcard sql/*.sql))
@@ -19,7 +19,7 @@ directories.stamp:
 
 $(OBJS): directories.stamp
 
-install: python_code 
+install: python_code
 
 sql/$(EXTENSION)--$(EXTVERSION).sql: sql/$(EXTENSION).sql directories.stamp
 	cp $< $@

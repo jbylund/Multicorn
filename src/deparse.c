@@ -24,6 +24,7 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/plannodes.h"
 #include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "utils/builtins.h"
@@ -37,109 +38,40 @@
 
 
 /*
- * Returns true if given expr is safe to evaluate on the foreign server.
+ * Global context for multicorn_foreign_expr_walker's search of an expression tree.
  */
-bool
-multicorn_is_foreign_expr(PlannerInfo *root,
-					      RelOptInfo *baserel,
-					      Expr *expr)
+typedef struct foreign_glob_cxt
 {
-	foreign_glob_cxt glob_cxt;
-	foreign_loc_cxt loc_cxt;
-	MulticornFdwRelationInfo *fpinfo = (MulticornFdwRelationInfo *) (baserel->fdw_private);
+	PlannerInfo *root;			/* global planner state */
+	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
 
 	/*
-	 * Check that the expression consists of nodes that are safe to execute
-	 * remotely.
+	 * For join pushdown, only a limited set of operators are allowed to be
+	 * pushed.  This flag helps us identify if we are walking through the list
+	 * of join conditions. Also true for aggregate relations to restrict
+	 * aggregates for specified list.
 	 */
-	glob_cxt.root = root;
-	glob_cxt.foreignrel = baserel;
-
-	/*
-	 * For an upper relation, use relids from its underneath scan relation,
-	 * because the upperrel's own relids currently aren't set to anything
-	 * meaningful by the core code.  For other relation, use their own relids.
-	 */
-	if (IS_UPPER_REL(baserel))
-		glob_cxt.relids = fpinfo->outerrel->relids;
-	else
-		glob_cxt.relids = baserel->relids;
-	loc_cxt.collation = InvalidOid;
-	loc_cxt.state = FDW_COLLATE_NONE;
-	if (!multicorn_foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
-		return false;
-
-	/*
-	 * If the expression has a valid collation that does not arise from a
-	 * foreign var, the expression can not be sent over.
-	 */
-	if (loc_cxt.state == FDW_COLLATE_UNSAFE)
-		return false;
-
-	/*
-	 * An expression which includes any mutable functions can't be sent over
-	 * because its result is not stable.  For example, sending now() remote
-	 * side could cause confusion from clock offsets.  Future versions might
-	 * be able to make this choice with more granularity. (We check this last
-	 * because it requires a lot of expensive catalog lookups.)
-	 */
-	if (contain_mutable_functions((Node *) expr))
-		return false;
-
-	/* OK to evaluate on the remote server */
-	return true;
-}
-
+	bool		is_remote_cond;	/* true for join or aggregate relations */
+	Relids		relids;			/* relids of base relations in the underlying
+								 * scan */
+} foreign_glob_cxt;
 
 /*
- * Returns true if given expr is something we'd have to send the value of
- * to the foreign server.
- *
- * This should return true when the expression is a shippable node that
- * deparseExpr would add to context->params_list.  Note that we don't care
- * if the expression *contains* such a node, only whether one appears at top
- * level.  We need this to detect cases where setrefs.c would recognize a
- * false match between an fdw_exprs item (which came from the params_list)
- * and an entry in fdw_scan_tlist (which we're considering putting the given
- * expression into).
+ * Local (per-tree-level) context for multicorn_foreign_expr_walker's search.
+ * This is concerned with identifying collations used in the expression.
  */
-bool
-multicorn_is_foreign_param(PlannerInfo *root,
-						   RelOptInfo *baserel,
-						   Expr *expr)
+typedef enum
 {
-	if (expr == NULL)
-		return false;
+	FDW_COLLATE_NONE,			/* expression is of a noncollatable type */
+	FDW_COLLATE_SAFE,			/* collation derives from a foreign Var */
+	FDW_COLLATE_UNSAFE			/* collation derives from something else */
+} FDWCollateState;
 
-	switch (nodeTag(expr))
-	{
-		case T_Var:
-			{
-				/* It would have to be sent unless it's a foreign Var */
-				Var		   *var = (Var *) expr;
-				MulticornFdwRelationInfo *fpinfo = (MulticornFdwRelationInfo *) (baserel->fdw_private);
-				Relids		relids;
-
-				if (IS_UPPER_REL(baserel))
-					relids = fpinfo->outerrel->relids;
-				else
-					relids = baserel->relids;
-
-				if (bms_is_member(var->varno, relids) && var->varlevelsup == 0)
-					return false;	/* foreign Var, so not a param */
-				else
-					return true;	/* it'd have to be a param */
-				break;
-			}
-		case T_Param:
-			/* Params always have to be sent to the foreign server */
-			return true;
-		default:
-			break;
-	}
-	return false;
-}
-
+typedef struct foreign_loc_cxt
+{
+	Oid			collation;		/* OID of current collation, if any */
+	FDWCollateState state;		/* state of current collation choice */
+} foreign_loc_cxt;
 
 /*
  * Return true if given object is one of PostgreSQL's built-in objects.
@@ -207,7 +139,7 @@ multicorn_foreign_expr_walker(Node *node,
 						      foreign_loc_cxt *outer_cxt)
 {
 	bool		check_type = true;
-    MulticornFdwRelationInfo *fpinfo;
+    //MulticornFdwRelationInfo *fpinfo;
 	foreign_loc_cxt inner_cxt;
 	Oid			collation = InvalidOid;
 	FDWCollateState state = FDW_COLLATE_NONE;
@@ -219,7 +151,7 @@ multicorn_foreign_expr_walker(Node *node,
 		return true;
 
     /* May need server info from baserel's fdw_private struct */
-	fpinfo = (MulticornFdwRelationInfo *) (glob_cxt->foreignrel->fdw_private);
+	//fpinfo = (MulticornFdwRelationInfo *) (glob_cxt->foreignrel->fdw_private);
 
 	/* Set up inner_cxt for possible recursion to child nodes */
 	inner_cxt.collation = InvalidOid;
@@ -672,7 +604,7 @@ multicorn_foreign_expr_walker(Node *node,
 				/*
 				 * Recurse to input subexpressions.
 				 */
-				if (!mutlicorn_foreign_expr_walker((Node *) nt->arg,
+				if (!multicorn_foreign_expr_walker((Node *) nt->arg,
 												   glob_cxt, &inner_cxt))
 					return false;
 
@@ -952,4 +884,108 @@ multicorn_foreign_expr_walker(Node *node,
 	}
 	/* It looks OK */
 	return true;
+}
+
+/*
+ * Returns true if given expr is safe to evaluate on the foreign server.
+ */
+bool
+multicorn_is_foreign_expr(PlannerInfo *root,
+					      RelOptInfo *baserel,
+					      Expr *expr)
+{
+	foreign_glob_cxt glob_cxt;
+	foreign_loc_cxt loc_cxt;
+	MulticornFdwRelationInfo *fpinfo = (MulticornFdwRelationInfo *) (baserel->fdw_private);
+
+	/*
+	 * Check that the expression consists of nodes that are safe to execute
+	 * remotely.
+	 */
+	glob_cxt.root = root;
+	glob_cxt.foreignrel = baserel;
+
+	/*
+	 * For an upper relation, use relids from its underneath scan relation,
+	 * because the upperrel's own relids currently aren't set to anything
+	 * meaningful by the core code.  For other relation, use their own relids.
+	 */
+	if (IS_UPPER_REL(baserel))
+		glob_cxt.relids = fpinfo->outerrel->relids;
+	else
+		glob_cxt.relids = baserel->relids;
+	loc_cxt.collation = InvalidOid;
+	loc_cxt.state = FDW_COLLATE_NONE;
+	if (!multicorn_foreign_expr_walker((Node *) expr, &glob_cxt, &loc_cxt))
+		return false;
+
+	/*
+	 * If the expression has a valid collation that does not arise from a
+	 * foreign var, the expression can not be sent over.
+	 */
+	if (loc_cxt.state == FDW_COLLATE_UNSAFE)
+		return false;
+
+	/*
+	 * An expression which includes any mutable functions can't be sent over
+	 * because its result is not stable.  For example, sending now() remote
+	 * side could cause confusion from clock offsets.  Future versions might
+	 * be able to make this choice with more granularity. (We check this last
+	 * because it requires a lot of expensive catalog lookups.)
+	 */
+	if (contain_mutable_functions((Node *) expr))
+		return false;
+
+	/* OK to evaluate on the remote server */
+	return true;
+}
+
+
+/*
+ * Returns true if given expr is something we'd have to send the value of
+ * to the foreign server.
+ *
+ * This should return true when the expression is a shippable node that
+ * deparseExpr would add to context->params_list.  Note that we don't care
+ * if the expression *contains* such a node, only whether one appears at top
+ * level.  We need this to detect cases where setrefs.c would recognize a
+ * false match between an fdw_exprs item (which came from the params_list)
+ * and an entry in fdw_scan_tlist (which we're considering putting the given
+ * expression into).
+ */
+bool
+multicorn_is_foreign_param(PlannerInfo *root,
+						   RelOptInfo *baserel,
+						   Expr *expr)
+{
+	if (expr == NULL)
+		return false;
+
+	switch (nodeTag(expr))
+	{
+		case T_Var:
+			{
+				/* It would have to be sent unless it's a foreign Var */
+				Var		   *var = (Var *) expr;
+				MulticornFdwRelationInfo *fpinfo = (MulticornFdwRelationInfo *) (baserel->fdw_private);
+				Relids		relids;
+
+				if (IS_UPPER_REL(baserel))
+					relids = fpinfo->outerrel->relids;
+				else
+					relids = baserel->relids;
+
+				if (bms_is_member(var->varno, relids) && var->varlevelsup == 0)
+					return false;	/* foreign Var, so not a param */
+				else
+					return true;	/* it'd have to be a param */
+				break;
+			}
+		case T_Param:
+			/* Params always have to be sent to the foreign server */
+			return true;
+		default:
+			break;
+	}
+	return false;
 }

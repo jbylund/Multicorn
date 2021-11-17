@@ -12,6 +12,8 @@
 #include "optimizer/planmain.h"
 #include "optimizer/restrictinfo.h"
 #include "optimizer/clauses.h"
+#include "optimizer/optimizer.h"
+#include "optimizer/tlist.h"
 #if PG_VERSION_NUM < 120000
 #include "optimizer/var.h"
 #include "dynloader.h"
@@ -115,11 +117,27 @@ static bool multicornIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *re
 											RangeTblEntry *rte);
 #endif
 
+static void multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
+						      RelOptInfo *input_rel, RelOptInfo *output_rel
+#if (PG_VERSION_NUM >= 110000)
+						      ,void *extra
+#endif
+        );
+
 static void multicorn_xact_callback(XactEvent event, void *arg);
 
 /* Functions relating to scanning through subrelations */
 static bool subscanReadRow(TupleTableSlot *slot, Relation subscanRel, void *subscanState);
 static void subscanEnd(ForeignScanState *node);
+static bool multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
+                                          Node *havingQual);
+static void multicorn_add_foreign_grouping_paths(PlannerInfo *root,
+											  RelOptInfo *input_rel,
+											  RelOptInfo *grouped_rel
+#if (PG_VERSION_NUM >= 110000)
+											  ,GroupPathExtraData *extra
+#endif
+);
 
 /*	Helpers functions */
 static AttrNumber *buildConvertMapIfNeeded(TupleDesc indesc, TupleDesc outDesc);
@@ -224,7 +242,7 @@ multicorn_handler(PG_FUNCTION_ARGS)
 #endif
 
     /* Support functions for upper relation push-down */
-	fdwroutine->GetForeignUpperPaths = multicornGetForeignUpperPaths;
+	fdw_routine->GetForeignUpperPaths = multicornGetForeignUpperPaths;
 
 	PG_RETURN_POINTER(fdw_routine);
 }
@@ -1714,7 +1732,7 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 {
 	MulticornFdwRelationInfo *fpinfo;
 
-	debug_elog(DEBUG1, "multicorn_fdw : %s", __func__);
+	debug_elog("multicorn_fdw : %s", __func__);
 
 	/*
 	 * If input rel is not safe to pushdown, then simply return as we cannot
@@ -1756,7 +1774,7 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 // 				);
 // 			break;
 		default:
-			debug_elog(ERROR, "unexpected upper relation: %d", (int) stage);
+			elog(ERROR, "unexpected upper relation: %d", (int) stage);
 			break;
 	}
 }
@@ -1807,9 +1825,12 @@ multicorn_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 
 	fpinfo->shippable_extensions = ifpinfo->shippable_extensions;
 
-	/* Assess if it is safe to push down aggregation and grouping. */
+    /* Assess if it is safe to push down aggregation and grouping. */
+#if PG_VERSION_NUM >= 110000
+	if (!multicorn_foreign_grouping_ok(root, grouped_rel, extra->havingQual))
+#elif PG_VERSION_NUM >= 100000
 	if (!multicorn_foreign_grouping_ok(root, grouped_rel))
-		return;
+#endif
 
 	/* Use small cost to push down aggregate always */
 	rows = width = startup_cost = total_cost = 1;
