@@ -505,6 +505,7 @@ multicornGetForeignPlan(PlannerInfo *root,
 	best_path->path.pathtarget->width = planstate->width;
 #endif
 	scan_clauses = extract_actual_clauses(scan_clauses, false);
+    
 	/* Extract the quals coming from a parameterized path, if any */
 	if (best_path->path.param_info)
 	{
@@ -515,7 +516,9 @@ multicornGetForeignPlan(PlannerInfo *root,
 								&planstate->qual_list);
 		}
 	}
+
 	planstate->pathkeys = (List *) best_path->fdw_private;
+
 	return make_foreignscan(tlist,
 							scan_clauses,
 							scan_relid,
@@ -1470,7 +1473,7 @@ static bool
 multicornIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
 								RangeTblEntry *rte)
 {
-	return true;
+	return false;  /* TODO: revert this to true when done with debugging */
 }
 #endif
 
@@ -1743,10 +1746,7 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 		return;
 
 	/* Ignore stages we don't support; and skip any duplicate calls. */
-	if ((stage != UPPERREL_GROUP_AGG &&
-		 stage != UPPERREL_ORDERED &&
-		 stage != UPPERREL_FINAL) ||
-		output_rel->fdw_private)
+	if (stage != UPPERREL_GROUP_AGG || output_rel->fdw_private)
 		return;
 
 	fpinfo = (MulticornFdwRelationInfo *) palloc0(sizeof(MulticornFdwRelationInfo));
