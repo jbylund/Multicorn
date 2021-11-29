@@ -59,7 +59,27 @@ typedef struct ConversionInfo
 	bool		need_quote;
 }	ConversionInfo;
 
+/*
+ * This enum describes what's kept in the fdw_private list for a ForeignPath.
+ * We store:
+ *
+ * 1) Boolean flag showing if the remote query has the final sort
+ * 2) Boolean flag showing if the remote query has the LIMIT clause
+ */
+enum FdwPathPrivateIndex
+{
+	/* has-final-sort flag (as an integer Value node) */
+	FdwPathPrivateHasFinalSort,
+	/* has-limit flag (as an integer Value node) */
+	FdwPathPrivateHasLimit
+};
 
+/*
+ * FDW-specific planner information kept in RelOptInfo.fdw_private for a
+ * multicorn foreign table.
+ * multicornGetForeignJoinPaths creates it for a joinrel (not implemented yet),
+ * and mutlicornGetForeignUpperPaths creates it for an upperrel.
+ */
 typedef struct MulticornPlanState
 {
 	Oid			foreigntableid;
@@ -78,95 +98,8 @@ typedef struct MulticornPlanState
 	 * getRelSize to GetForeignPlan.
 	 */
 	int width;
-}	MulticornPlanState;
 
-typedef struct MulticornExecState
-{
-	/* instance and iterator */
-	PyObject   *fdw_instance;
-	PyObject   *p_iterator;
-	/* Information carried from the plan phase. */
-	List	   *target_list;
-	List	   *qual_list;
-	Datum	   *values;
-	bool	   *nulls;
-	ConversionInfo **cinfos;
-	/* Common buffer to avoid repeated allocations */
-	StringInfo	buffer;
-	AttrNumber	rowidAttno;
-	char	   *rowidAttrName;
-	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
-	/* State related to scanning through CStore chunks / temporarily
-	 * materialized tables
-	 */
-	MemoryContext   subscanCxt;
-	void           *subscanState;
-	Relation        subscanRel;
-	TupleTableSlot *subscanSlot;
-	AttrNumber     *subscanAttrMap;
-	uint64          tuplesRead;
-}	MulticornExecState;
-
-typedef struct MulticornModifyState
-{
-	ConversionInfo **cinfos;
-	ConversionInfo **resultCinfos;
-	PyObject   *fdw_instance;
-	StringInfo	buffer;
-	AttrNumber	rowidAttno;
-	char	   *rowidAttrName;
-	ConversionInfo *rowidCinfo;
-}	MulticornModifyState;
-
-
-typedef struct MulticornBaseQual
-{
-	AttrNumber	varattno;
-	NodeTag		right_type;
-	Oid			typeoid;
-	char	   *opname;
-	bool		isArray;
-	bool		useOr;
-}	MulticornBaseQual;
-
-typedef struct MulticornConstQual
-{
-	MulticornBaseQual base;
-	Datum		value;
-	bool		isnull;
-}	MulticornConstQual;
-
-typedef struct MulticornVarQual
-{
-	MulticornBaseQual base;
-	AttrNumber	rightvarattno;
-}	MulticornVarQual;
-
-typedef struct MulticornParamQual
-{
-	MulticornBaseQual base;
-	Expr	   *expr;
-}	MulticornParamQual;
-
-typedef struct MulticornDeparsedSortGroup
-{
-	Name 			attname;
-	int				attnum;
-	bool			reversed;
-	bool			nulls_first;
-	Name			collate;
-	PathKey	*key;
-} MulticornDeparsedSortGroup;
-
-/*
- * FDW-specific planner information kept in RelOptInfo.fdw_private for a
- * multicorn_fdw foreign table.
- * multicornGetForeignJoinPaths creates it for a joinrel (not implemented yet),
- * and mutlicornGetForeignUpperPaths creates it for an upperrel.
- */
-typedef struct MulticornFdwRelationInfo
-{
-	/*
+    /*
 	 * True means that the relation can be pushed down. Always true for simple
 	 * foreign scan.
 	 */
@@ -176,12 +109,11 @@ typedef struct MulticornFdwRelationInfo
 	List	   *remote_conds;
 	List	   *local_conds;
 
-	/* Actual remote restriction clauses for scan (sans RestrictInfos) */
+    /* Actual remote restriction clauses for scan (sans RestrictInfos) */
 	List	   *final_remote_exprs;
 
 	/* Estimated size and cost for a scan or join. */
 	double		rows;
-	int			width;
 	Cost		startup_cost;
 	Cost		total_cost;
 
@@ -251,7 +183,88 @@ typedef struct MulticornFdwRelationInfo
 
 	/* Function pushdown surppot in target list */
 	bool		is_tlist_func_pushdown;
-}	MulticornFdwRelationInfo;
+}	MulticornPlanState;
+
+typedef struct MulticornExecState
+{
+	/* instance and iterator */
+	PyObject   *fdw_instance;
+	PyObject   *p_iterator;
+	/* Information carried from the plan phase. */
+	List	   *target_list;
+	List	   *qual_list;
+	Datum	   *values;
+	bool	   *nulls;
+	ConversionInfo **cinfos;
+	/* Common buffer to avoid repeated allocations */
+	StringInfo	buffer;
+	AttrNumber	rowidAttno;
+	char	   *rowidAttrName;
+	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
+	/* State related to scanning through CStore chunks / temporarily
+	 * materialized tables
+	 */
+	MemoryContext   subscanCxt;
+	void           *subscanState;
+	Relation        subscanRel;
+	TupleTableSlot *subscanSlot;
+	AttrNumber     *subscanAttrMap;
+	uint64          tuplesRead;
+    Relation	rel;			/* relcache entry for the foreign table. NULL
+								 * for a foreign join scan. */
+	TupleDesc	tupdesc;		/* tuple descriptor of scan */
+}	MulticornExecState;
+
+typedef struct MulticornModifyState
+{
+	ConversionInfo **cinfos;
+	ConversionInfo **resultCinfos;
+	PyObject   *fdw_instance;
+	StringInfo	buffer;
+	AttrNumber	rowidAttno;
+	char	   *rowidAttrName;
+	ConversionInfo *rowidCinfo;
+}	MulticornModifyState;
+
+
+typedef struct MulticornBaseQual
+{
+	AttrNumber	varattno;
+	NodeTag		right_type;
+	Oid			typeoid;
+	char	   *opname;
+	bool		isArray;
+	bool		useOr;
+}	MulticornBaseQual;
+
+typedef struct MulticornConstQual
+{
+	MulticornBaseQual base;
+	Datum		value;
+	bool		isnull;
+}	MulticornConstQual;
+
+typedef struct MulticornVarQual
+{
+	MulticornBaseQual base;
+	AttrNumber	rightvarattno;
+}	MulticornVarQual;
+
+typedef struct MulticornParamQual
+{
+	MulticornBaseQual base;
+	Expr	   *expr;
+}	MulticornParamQual;
+
+typedef struct MulticornDeparsedSortGroup
+{
+	Name 			attname;
+	int				attnum;
+	bool			reversed;
+	bool			nulls_first;
+	Name			collate;
+	PathKey	*key;
+} MulticornDeparsedSortGroup;
 
 extern bool multicorn_is_foreign_expr(PlannerInfo *root,
 								      RelOptInfo *baserel,
@@ -324,6 +337,7 @@ PyObject   *datumToPython(Datum node, Oid typeoid, ConversionInfo * cinfo);
 
 List	*serializeDeparsedSortGroup(List *pathkeys);
 List	*deserializeDeparsedSortGroup(List *items);
+extern List *multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel);
 
 #endif   /* PG_MULTICORN_H */
 

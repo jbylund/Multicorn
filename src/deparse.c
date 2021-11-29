@@ -139,7 +139,7 @@ multicorn_foreign_expr_walker(Node *node,
 						      foreign_loc_cxt *outer_cxt)
 {
 	bool		check_type = true;
-    //MulticornFdwRelationInfo *fpinfo;
+    //MulticornPlanState *fpinfo;
 	foreign_loc_cxt inner_cxt;
 	Oid			collation = InvalidOid;
 	FDWCollateState state = FDW_COLLATE_NONE;
@@ -151,7 +151,7 @@ multicorn_foreign_expr_walker(Node *node,
 		return true;
 
     /* May need server info from baserel's fdw_private struct */
-	//fpinfo = (MulticornFdwRelationInfo *) (glob_cxt->foreignrel->fdw_private);
+	//fpinfo = (MulticornPlanState *) (glob_cxt->foreignrel->fdw_private);
 
 	/* Set up inner_cxt for possible recursion to child nodes */
 	inner_cxt.collation = InvalidOid;
@@ -896,7 +896,7 @@ multicorn_is_foreign_expr(PlannerInfo *root,
 {
 	foreign_glob_cxt glob_cxt;
 	foreign_loc_cxt loc_cxt;
-	MulticornFdwRelationInfo *fpinfo = (MulticornFdwRelationInfo *) (baserel->fdw_private);
+	MulticornPlanState *fpinfo = (MulticornPlanState *) (baserel->fdw_private);
 
 	/*
 	 * Check that the expression consists of nodes that are safe to execute
@@ -967,7 +967,7 @@ multicorn_is_foreign_param(PlannerInfo *root,
 			{
 				/* It would have to be sent unless it's a foreign Var */
 				Var		   *var = (Var *) expr;
-				MulticornFdwRelationInfo *fpinfo = (MulticornFdwRelationInfo *) (baserel->fdw_private);
+				MulticornPlanState *fpinfo = (MulticornPlanState *) (baserel->fdw_private);
 				Relids		relids;
 
 				if (IS_UPPER_REL(baserel))
@@ -988,4 +988,45 @@ multicorn_is_foreign_param(PlannerInfo *root,
 			break;
 	}
 	return false;
+}
+
+/*
+ * Build the targetlist for given relation to be deparsed as SELECT clause.
+ *
+ * The output targetlist contains the columns that need to be fetched from the
+ * foreign server for the given relation.  If foreignrel is an upper relation,
+ * then the output targetlist can also contains expressions to be evaluated on
+ * foreign server.
+ */
+List *
+multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel)
+{
+	List	   *tlist = NIL;
+	MulticornPlanState *fpinfo = (MulticornPlanState *) foreignrel->fdw_private;
+	ListCell   *lc;
+
+	/*
+	 * For an upper relation, we have already built the target list while
+	 * checking shippability, so just return that.
+	 */
+	if (IS_UPPER_REL(foreignrel))
+		return fpinfo->grouped_tlist;
+
+	/*
+	 * We require columns specified in foreignrel->reltarget->exprs and those
+	 * required for evaluating the local conditions.
+	 */
+	tlist = add_to_flat_tlist(tlist,
+							  pull_var_clause((Node *) foreignrel->reltarget->exprs,
+											  PVC_RECURSE_PLACEHOLDERS));
+	foreach(lc, fpinfo->local_conds)
+	{
+		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
+
+		tlist = add_to_flat_tlist(tlist,
+								  pull_var_clause((Node *) rinfo->clause,
+												  PVC_RECURSE_PLACEHOLDERS));
+	}
+
+	return tlist;
 }
