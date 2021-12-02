@@ -72,10 +72,8 @@ static ForeignScan *multicornGetForeignPlan(PlannerInfo *root,
 						Oid foreigntableid,
 						ForeignPath *best_path,
 						List *tlist,
-						List *scan_clauses
-#if PG_VERSION_NUM >= 90500
-						, Plan *outer_plan
-#endif
+						List *scan_clauses,
+                        Plan *outer_plan
 		);
 static void multicornExplainForeignScan(ForeignScanState *node, ExplainState *es);
 static void multicornBeginForeignScan(ForeignScanState *node, int eflags);
@@ -83,7 +81,6 @@ static TupleTableSlot *multicornIterateForeignScan(ForeignScanState *node);
 static void multicornReScanForeignScan(ForeignScanState *node);
 static void multicornEndForeignScan(ForeignScanState *node);
 
-#if PG_VERSION_NUM >= 90300
 static void multicornAddForeignUpdateTargets(Query *parsetree,
 								 RangeTblEntry *target_rte,
 								 Relation target_relation);
@@ -108,14 +105,11 @@ static void multicornEndForeignModify(EState *estate, ResultRelInfo *resultRelIn
 
 static void multicorn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 						   SubTransactionId parentSubid, void *arg);
-#endif
 
-#if PG_VERSION_NUM >= 90500
 static List *multicornImportForeignSchema(ImportForeignSchemaStmt * stmt,
 							 Oid serverOid);
 static bool multicornIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
 											RangeTblEntry *rte);
-#endif
 
 static void multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 						      RelOptInfo *input_rel, RelOptInfo *output_rel, void *extra
@@ -310,6 +304,9 @@ multicornGetForeignRelSize(PlannerInfo *root,
 	planstate->foreigntableid = foreigntableid;
 	/* Initialize the conversion info array */
 	{
+        /* ftable->relid is equal to foreigntableid, so it seems that ftable may
+         * be redundant, apart from the cache operations performed in GetForeignTable
+         */
 		Relation	rel = RelationIdGetRelation(ftable->relid);
 		AttInMetadata *attinmeta;
 
@@ -352,12 +349,19 @@ multicornGetForeignRelSize(PlannerInfo *root,
 	}
 	else
 	{
-		/* Pull "var" clauses to build an appropriate target list */
-#if PG_VERSION_NUM >= 90600
+		/* Pull "var" clauses to build an appropriate target list
+         *
+         * baserel->baserestrictinfo is particularly interesting, as it contains
+         * restriction quals (WHERE clauses) that should be used to filter the
+         * rows to be fetched. (The FDW itself is not required to enforce these
+         * quals, as the core executor can check them instead.)
+         *
+         * baserel->reltarget->exprs can be used to determine which columns need
+         * to be fetched; but note that it only lists columns that have to be
+         * emitted by the ForeignScan plan node, not columns that are used in
+         * qual evaluation but not output by the query.
+         */
 		foreach(lc, extractColumns(baserel->reltarget->exprs, baserel->baserestrictinfo))
-#else
-		foreach(lc, extractColumns(baserel->reltargetlist, baserel->baserestrictinfo))
-#endif
 		{
 			Var		   *var = (Var *) lfirst(lc);
 			Value	   *colname;
@@ -379,15 +383,10 @@ multicornGetForeignRelSize(PlannerInfo *root,
 	{
 		extractRestrictions(baserel->relids, ((RestrictInfo *) lfirst(lc))->clause,
 							&planstate->qual_list);
-
 	}
 	/* Inject the "rows" and "width" attribute into the baserel */
-#if PG_VERSION_NUM >= 90600
 	getRelSize(planstate, root, &baserel->rows, &baserel->reltarget->width);
 	planstate->width = baserel->reltarget->width;
-#else
-	getRelSize(planstate, root, &baserel->rows, &baserel->width);
-#endif
 }
 
 /*
@@ -419,21 +418,13 @@ multicornGetForeignPaths(PlannerInfo *root,
 
 	/* Add a simple default path */
 	pathes = lappend(pathes, create_foreignscan_path(root, baserel,
-#if PG_VERSION_NUM >= 90600
-													  NULL,  /* default pathtarget */
-#endif
+			NULL,  /* default pathtarget */
 			baserel->rows,
 			planstate->startupCost,
-#if PG_VERSION_NUM >= 90600
 			baserel->rows * baserel->reltarget->width,
-#else
-			baserel->rows * baserel->width,
-#endif
 			NIL,		/* no pathkeys */
 			NULL,
-#if PG_VERSION_NUM >= 90500
 			NULL,
-#endif
 			NULL));
 
 	/* Handle sort pushdown */
@@ -463,15 +454,11 @@ multicornGetForeignPaths(PlannerInfo *root,
 			ForeignPath *newpath;
 
 			newpath = create_foreignscan_path(root, baserel,
-#if PG_VERSION_NUM >= 90600
-													  NULL,  /* default pathtarget */
-#endif
+					NULL,  /* default pathtarget */
 					path->path.rows,
 					path->path.startup_cost, path->path.total_cost,
 					apply_pathkeys, NULL,
-#if PG_VERSION_NUM >= 90500
 					NULL,
-#endif
 					(void *) deparsed_pathkeys);
 
 			newpath->path.param_info = path->path.param_info;
@@ -502,6 +489,10 @@ multicornGetForeignPlan(PlannerInfo *root,
 	List	   *fdw_scan_tlist = NIL;
 	List	   *fdw_recheck_quals = NIL;
 	ListCell   *lc;
+    StringInfoData sql;
+    bool    has_limit = false;
+    List	   *params_list = NIL;
+	List	   *retrieved_attrs;
 
 	best_path->path.pathtarget->width = planstate->width;
 
@@ -662,6 +653,12 @@ multicornGetForeignPlan(PlannerInfo *root,
 		}
 	}
 
+    /* hacky deparse aggr info (inspired by deparse select from GridDBFdw) */
+    initStringInfo(&sql);
+    multicorn_deparse_select(&sql, root, foreignrel,
+                        best_path->path.pathkeys,
+                        &retrieved_attrs, &params_list, fdw_scan_tlist, has_limit);
+
 	/*
 	 * Create the ForeignScan node for the given relation.
 	 *
@@ -714,6 +711,9 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
 	MulticornExecState *execstate;
 	ListCell   *lc;
+    Relation	rel;
+    TupleDesc	desc;
+    AttInMetadata *attinmeta;
 
     execstate = initializeExecState(fscan->fdw_private);
 
@@ -745,7 +745,18 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 							((Expr *) lfirst(lc)),
 							&execstate->qual_list);
 	}
-	initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc));
+
+    /* Setup to re-initialize conversion info as in the planning phase, since
+     * extracting it from TupleDescGetAttInMetadata(execstate->tupdesc) doesn't
+     * work in case of aggregation. The reason for that is that in grouped_tlist
+     * we strip the relname's inside of multicorn_foreign_grouping_ok for some
+     * reason.
+     */
+    rel = RelationIdGetRelation(execstate->foreigntableid);
+    desc = RelationGetDescr(rel);
+    attinmeta = TupleDescGetAttInMetadata(desc);
+	initConversioninfo(execstate->cinfos, attinmeta);
+	// initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc));
 
 	execstate->subscanCxt = AllocSetContextCreate(
 		node->ss.ps.state->es_query_cxt,
@@ -1211,8 +1222,6 @@ multicornEndForeignScan(ForeignScanState *node)
 }
 
 
-
-#if PG_VERSION_NUM >= 90300
 /*
 * multicornAddForeigUpdateTargets
 *		Add resjunk columns needed for update/delete.
@@ -1490,7 +1499,6 @@ multicorn_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 		entry->xact_depth--;
 	}
 }
-#endif
 
 /*
  * Callback used to propagate pre-commit / commit / rollback.
@@ -1531,7 +1539,6 @@ multicorn_xact_callback(XactEvent event, void *arg)
 	}
 }
 
-#if PG_VERSION_NUM >= 90500
 static List *
 multicornImportForeignSchema(ImportForeignSchemaStmt * stmt,
 							 Oid serverOid)
@@ -1641,7 +1648,6 @@ multicornIsForeignScanParallelSafe(PlannerInfo *root, RelOptInfo *rel,
 {
 	return false;  /* TODO: revert this to true when done with debugging */
 }
-#endif
 
 /*
  * Merge FDW options from input relations into a new set of options for a join
@@ -1677,9 +1683,14 @@ multicorn_merge_fdw_options(MulticornPlanState *fpinfo,
 
     fpinfo->table = fpinfo_o->table;
 	fpinfo->server = fpinfo_o->server;
+    fpinfo->fdw_instance = fpinfo_o->fdw_instance;
     fpinfo->foreigntableid = fpinfo_o->foreigntableid;
 	fpinfo->numattrs = fpinfo_o->numattrs;
-    fpinfo->fdw_instance = fpinfo_o->fdw_instance;
+    fpinfo->cinfos = fpinfo_o->cinfos;
+    fpinfo->pathkeys = fpinfo_o->pathkeys;
+    fpinfo->target_list = fpinfo_o->target_list;
+    fpinfo->qual_list = fpinfo_o->qual_list;
+    fpinfo->pathkeys = fpinfo_o->pathkeys;
 
 	/* Merge the table level options from either side of the join. */
 	if (fpinfo_i)
@@ -1717,7 +1728,8 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	Query	   *query = root->parse;
 	MulticornPlanState *fpinfo = (MulticornPlanState *) grouped_rel->fdw_private;
     PathTarget *grouping_target = grouped_rel->reltarget;
-    // Or perhaps like in SQLite FDW `PathTarget *grouping_target = root->upper_targets[UPPERREL_GROUP_AGG];`?
+    // Q: Or perhaps like in SQLite FDW `PathTarget *grouping_target = root->upper_targets[UPPERREL_GROUP_AGG];`?
+    // A: It appears they are the same thing
 	MulticornPlanState *ofpinfo;
 	List	   *aggvars;
 	ListCell   *lc;
@@ -2068,6 +2080,10 @@ serializePlanState(MulticornPlanState * state)
 
 	result = lappend(result, serializeDeparsedSortGroup(state->pathkeys));
 
+    result = lappend(result, makeString(state->aggref->aggname->data));
+
+	result = lappend(result, makeString(state->aggref->columnname->data));
+
 	return result;
 }
 
@@ -2096,5 +2112,11 @@ initializeExecState(void *internalstate)
 	execstate->nulls = palloc(attnum * sizeof(bool));
 	execstate->subscanRel = NULL;
 	execstate->subscanState = NULL;
+    execstate->aggref = palloc0(sizeof(MulticornAggref));
+    execstate->aggref->aggname = makeStringInfo();
+    execstate->aggref->aggname->data = strVal(list_nth(values, 4));
+    execstate->aggref->columnname = makeStringInfo();
+    execstate->aggref->columnname->data = strVal(list_nth(values, 5));
+    execstate->foreigntableid = foreigntableid;
 	return execstate;
 }

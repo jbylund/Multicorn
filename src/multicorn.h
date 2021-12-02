@@ -75,6 +75,34 @@ enum FdwPathPrivateIndex
 };
 
 /*
+ * Struct for parsing and storing aggregation details, top be passed between
+ * planning and execution phases.
+ *
+ */
+typedef struct MulticornAggref
+{
+	StringInfo	aggname;
+	StringInfo	columnname;
+}   MulticornAggref;
+
+/*
+ * Context for multicorn_deparse_expr
+ */
+typedef struct deparse_expr_cxt
+{
+	PlannerInfo *root;			/* global planner state */
+	RelOptInfo *foreignrel;		/* the foreign relation we are planning for */
+	RelOptInfo *scanrel;		/* the underlying scan relation. Same as
+								 * foreignrel, when that represents a join or
+								 * a base relation. */
+
+	StringInfo	buf;			/* output buffer to append to */
+	List	  **params_list;	/* exprs that will become remote Params */
+	bool		can_skip_cast;	/* outer function can skip int2/int4/int8/float4/float8 cast */
+	MulticornAggref *aggref;
+} deparse_expr_cxt;
+
+/*
  * FDW-specific planner information kept in RelOptInfo.fdw_private for a
  * multicorn foreign table.
  * multicornGetForeignJoinPaths creates it for a joinrel (not implemented yet),
@@ -98,6 +126,9 @@ typedef struct MulticornPlanState
 	 * getRelSize to GetForeignPlan.
 	 */
 	int width;
+
+    /* Aggregate function information (inspired by GridDBFdw)*/
+	MulticornAggref *aggref;
 
     /*
 	 * True means that the relation can be pushed down. Always true for simple
@@ -181,7 +212,7 @@ typedef struct MulticornPlanState
 	 */
 	int			relation_index;
 
-	/* Function pushdown surppot in target list */
+	/* Function pushdown support in target list */
 	bool		is_tlist_func_pushdown;
 }	MulticornPlanState;
 
@@ -213,6 +244,11 @@ typedef struct MulticornExecState
     Relation	rel;			/* relcache entry for the foreign table. NULL
 								 * for a foreign join scan. */
 	TupleDesc	tupdesc;		/* tuple descriptor of scan */
+
+    /* Aggregate function information (inspired by GridDBFdw)*/
+	MulticornAggref *aggref;
+    /* To be used to regenerate cinfos */
+    Oid			foreigntableid;
 }	MulticornExecState;
 
 typedef struct MulticornModifyState
@@ -338,6 +374,15 @@ PyObject   *datumToPython(Datum node, Oid typeoid, ConversionInfo * cinfo);
 List	*serializeDeparsedSortGroup(List *pathkeys);
 List	*deserializeDeparsedSortGroup(List *items);
 extern List *multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel);
+extern void multicorn_deparse_select(StringInfo buf,
+                        PlannerInfo *root,
+                        RelOptInfo *baserel,
+                        // List *remote_conds,
+                        List *pathkeys,
+                        List **retrieved_attrs,
+                        List **params_list,
+                        List *tlist,
+                        bool has_limit);
 
 #endif   /* PG_MULTICORN_H */
 

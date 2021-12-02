@@ -73,6 +73,123 @@ typedef struct foreign_loc_cxt
 	FDWCollateState state;		/* state of current collation choice */
 } foreign_loc_cxt;
 
+static void multicorn_deparse_expr(Expr *node, deparse_expr_cxt *context);
+static void multicorn_deparse_var(Var *node, deparse_expr_cxt *context);
+static void multicorn_deparse_aggref(Aggref *node, deparse_expr_cxt *context);
+static void multicorn_append_function_name(Oid funcid, deparse_expr_cxt *context);
+static void multicorn_deparse_explicit_targetList(List *tlist,
+                                    bool is_returning,
+                                    List **retrieved_attrs,
+                                    deparse_expr_cxt *context);
+
+/*
+ * Deparse SELECT statement for given relation into buf.
+ *
+ * tlist contains the list of desired columns to be fetched from foreign server.
+ * For a base relation fpinfo->attrs_used is used to construct SELECT clause,
+ * hence the tlist is ignored for a base relation.
+ *
+ * remote_conds is the list of conditions to be deparsed as WHERE clause.
+ *
+ * If params_list is not NULL, it receives a list of Params and other-relation
+ * Vars used in the clauses; these values must be transmitted to the remote
+ * server as parameter values.
+ *
+ * If params_list is NULL, we're generating the query for EXPLAIN purposes,
+ * so Params and other-relation Vars should be replaced by dummy values.
+ *
+ * pathkeys is the list of pathkeys to order the result by.
+ *
+ * List of columns selected is returned in retrieved_attrs.
+ */
+void
+multicorn_deparse_select(StringInfo buf,
+                        PlannerInfo *root,
+                        RelOptInfo *baserel,
+                        // List *remote_conds,
+                        List *pathkeys,
+                        List **retrieved_attrs,
+                        List **params_list,
+                        List *tlist,
+                        bool has_limit)
+{
+	RangeTblEntry *rte;
+	Relation	rel;
+	MulticornPlanState *fpinfo = (MulticornPlanState *) baserel->fdw_private;
+	deparse_expr_cxt context;
+	MulticornAggref *aggref;
+	// List	   *quals;
+
+	/* Fill portions of context common to join and base relation */
+	context.buf = buf;
+	context.root = root;
+	context.foreignrel = baserel;
+	context.params_list = params_list;
+	context.scanrel = IS_UPPER_REL(baserel) ? fpinfo->outerrel : baserel;
+	aggref = palloc0(sizeof(MulticornAggref));
+	aggref->columnname = makeStringInfo();
+	aggref->aggname = makeStringInfo();
+	context.aggref = aggref;
+	context.can_skip_cast = false;
+
+	rte = planner_rt_fetch(context.scanrel->relid, root);
+
+	/*
+	 * Core code already has some lock on each rel being planned, so we can
+	 * use NoLock here.
+	 */
+	rel = table_open(rte->relid, NoLock);
+
+	appendStringInfoString(buf, "SELECT ");
+	if (IS_UPPER_REL(baserel) || fpinfo->is_tlist_func_pushdown == true)
+	{
+		multicorn_deparse_explicit_targetList(tlist, false, retrieved_attrs, &context);
+		fpinfo->aggref = context.aggref;
+	}
+	// else
+	// {
+	// 	multicorn_deparse_target_list(buf, root, baserel->relid, rel,
+	// 							   fpinfo->attrs_used, retrieved_attrs);
+	// }
+
+	// /*
+	//  * Construct FROM clause
+	//  */
+	// appendStringInfoString(buf, " FROM ");
+	// multicorn_deparse_relation(buf, rel);
+
+	// /*
+	//  * For upper relations, the WHERE clause is built from the remote
+	//  * conditions of the underlying scan relation; otherwise, we can use the
+	//  * supplied list of remote conditions directly.
+	//  */
+	// if (IS_UPPER_REL(baserel))
+	// {
+	// 	multicornFdwRelationInfo *ofpinfo;
+
+	// 	ofpinfo = (multicornFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+	// 	quals = ofpinfo->remote_conds;
+	// }
+	// else
+	// 	quals = remote_conds;
+
+	// /*
+	//  * Construct WHERE clause
+	//  */
+	// if (quals)
+	// 	multicorn_append_where_clause(quals, &context);
+
+	// /* Add ORDER BY clause if we found any useful pathkeys */
+	// if (pathkeys)
+	// 	multicorn_append_order_by_clause(pathkeys, &context);
+
+	// /* Add LIMIT clause if necessary */
+	// if (has_limit)
+	// 	multicorn_append_limit_clause(&context);
+
+	table_close(rel, NoLock);
+}
+
 /*
  * Return true if given object is one of PostgreSQL's built-in objects.
  *
@@ -1029,4 +1146,311 @@ multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel)
 	}
 
 	return tlist;
+}
+
+/*
+ * Construct name to use for given column, and emit it into buf.
+ * If it has a column_name FDW option, use that instead of attribute name.
+ */
+static void
+multicorn_deparse_column_ref(StringInfo buf, int varno, int varattno, deparse_expr_cxt *context)
+{
+	RangeTblEntry *rte;
+	char	   *colname = NULL;
+	List	   *options;
+	ListCell   *lc;
+	PlannerInfo *root = context->root;
+
+	/* varno must not be any of OUTER_VAR, INNER_VAR and INDEX_VAR. */
+	Assert(!IS_SPECIAL_VARNO(varno));
+
+	/* Get RangeTblEntry from array in PlannerInfo. */
+	rte = planner_rt_fetch(varno, root);
+
+	/*
+	 * If it's a column of a foreign table, and it has the column_name FDW
+	 * option, use that value.
+	 */
+	options = GetForeignColumnOptions(rte->relid, varattno);
+	foreach(lc, options)
+	{
+		DefElem    *def = (DefElem *) lfirst(lc);
+
+		if (strcmp(def->defname, "column_name") == 0)
+		{
+			colname = defGetString(def);
+			break;
+		}
+	}
+
+	/*
+	 * If it's a column of a regular table or it doesn't have column_name FDW
+	 * option, use attribute name.
+	 */
+	if (colname == NULL)
+		colname = get_attname(rte->relid, varattno
+#if (PG_VERSION_NUM >= 110000)
+							  ,false
+#endif
+			);
+
+	appendStringInfoString(buf, quote_identifier(colname));
+	if (context->aggref)
+	{
+		if (strcmp(context->aggref->columnname->data, "") == 0)
+			appendStringInfoString(context->aggref->columnname, colname);
+	}
+}
+
+static void
+multicorn_deparse_explicit_targetList(List *tlist,
+								      bool is_returning,
+								      List **retrieved_attrs,
+								      deparse_expr_cxt *context)
+{
+	ListCell   *lc;
+	StringInfo	buf = context->buf;
+	int			i = 0;
+
+	*retrieved_attrs = NIL;
+
+	foreach(lc, tlist)
+	{
+		TargetEntry *tle = lfirst_node(TargetEntry, lc);
+
+		if (i > 0)
+			appendStringInfoString(buf, ", ");
+		else if (is_returning)
+			appendStringInfoString(buf, " RETURNING ");
+
+		multicorn_deparse_expr((Expr *) tle->expr, context);
+
+		*retrieved_attrs = lappend_int(*retrieved_attrs, i + 1);
+		i++;
+	}
+
+	if (i == 0 && !is_returning)
+		appendStringInfoString(buf, "NULL");
+}
+
+/*
+ * Deparse given expression into context->buf.
+ *
+ * This function must support all the same node types that multicorn_foreign_expr_walker
+ * accepts.
+ *
+ * Note: unlike ruleutils.c, we just use a simple hard-wired parenthesization
+ * scheme: anything more complex than a Var, Const, function call or cast
+ * should be self-parenthesized.
+ */
+static void
+multicorn_deparse_expr(Expr *node, deparse_expr_cxt *context)
+{
+	if (node == NULL)
+		return;
+
+	switch (nodeTag(node))
+	{
+		case T_Var:
+			multicorn_deparse_var((Var *) node, context);
+			break;
+		// case T_Const:
+		// 	multicorn_deparse_const((Const *) node, context, 0);
+		// 	break;
+		// case T_Param:
+		// 	multicorn_deparse_param((Param *) node, context);
+		// 	break;
+		// case T_FuncExpr:
+		// 	multicorn_deparse_func_expr((FuncExpr *) node, context);
+		// 	break;
+		// case T_OpExpr:
+		// 	multicorn_deparse_op_expr((OpExpr *) node, context);
+		// 	break;
+		// case T_ScalarArrayOpExpr:
+		// 	multicorn_deparse_scalar_array_op_expr((ScalarArrayOpExpr *) node, context);
+		// 	break;
+		// case T_RelabelType:
+		// 	multicorn_deparse_relabel_type((RelabelType *) node, context);
+		// 	break;
+		// case T_BoolExpr:
+		// 	multicorn_deparse_bool_expr((BoolExpr *) node, context);
+		// 	break;
+		// case T_NullTest:
+		// 	multicorn_deparse_null_test((NullTest *) node, context);
+		// 	break;
+		// case T_ArrayExpr:
+		// 	multicorn_deparse_array_expr((ArrayExpr *) node, context);
+		// 	break;
+		// case T_CaseExpr:
+		// 	multicorn_deparse_case_expr((CaseExpr *) node, context);
+		// 	break;
+		// case T_CoalesceExpr:
+		// 	multicorn_deparse_coalesce_expr((CoalesceExpr *) node, context);
+		// 	break;
+		// case T_NullIfExpr:
+		// 	multicorn_deparse_null_if_expr((NullIfExpr *) node, context);
+		// 	break;
+		case T_Aggref:
+			multicorn_deparse_aggref((Aggref *) node, context);
+			break;
+		default:
+			elog(ERROR, "unsupported expression type for deparse: %d",
+				 (int) nodeTag(node));
+			break;
+	}
+}
+
+/*
+ * Deparse given Var node into context->buf.
+ *
+ * If the Var belongs to the foreign relation, just print its remote name.
+ * Otherwise, it's effectively a Param (and will in fact be a Param at
+ * run time).  Handle it the same way we handle plain Params --- it is
+ * unsupported on Multicorn.
+ */
+static void
+multicorn_deparse_var(Var *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	Relids		relids = context->scanrel->relids;
+
+	if (bms_is_member(node->varno, relids) && node->varlevelsup == 0)
+	{
+		/* Var belongs to foreign table */
+		multicorn_deparse_column_ref(buf, node->varno, node->varattno, context);
+	}
+	else
+	{
+		/* Does not reach here. */
+		elog(ERROR, "Parameter is unsupported");
+		Assert(false);
+	}
+}
+
+/*
+ * Deparse an Aggref node.
+ */
+static void
+multicorn_deparse_aggref(Aggref *node, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	bool		use_variadic;
+	MulticornAggref *aggref = context->aggref;
+
+	initStringInfo(aggref->aggname);
+	initStringInfo(aggref->columnname);
+
+	/* Only basic, non-split aggregation accepted. */
+	Assert(node->aggsplit == AGGSPLIT_SIMPLE);
+
+	/* Check if need to print VARIADIC (cf. ruleutils.c) */
+	use_variadic = node->aggvariadic;
+
+	/* Find aggregate name from aggfnoid which is a pg_proc entry */
+	multicorn_append_function_name(node->aggfnoid, context);
+	appendStringInfoChar(buf, '(');
+
+	/* Add DISTINCT */
+	appendStringInfoString(buf, (node->aggdistinct != NIL) ? "DISTINCT " : "");
+
+	if (AGGKIND_IS_ORDERED_SET(node->aggkind))
+	{
+		/* Add WITHIN GROUP (ORDER BY ..) */
+		ListCell   *arg;
+		bool		first = true;
+
+		Assert(!node->aggvariadic);
+		Assert(node->aggorder != NIL);
+
+		foreach(arg, node->aggdirectargs)
+		{
+			if (!first)
+				appendStringInfoString(buf, ", ");
+			first = false;
+
+			multicorn_deparse_expr((Expr *) lfirst(arg), context);
+		}
+
+		appendStringInfoString(buf, ") WITHIN GROUP (ORDER BY ");
+		// multicorn_append_agg_order_by(node->aggorder, node->args, context);
+	}
+	else
+	{
+		/* aggstar can be set only in zero-argument aggregates */
+		if (node->aggstar)
+		{
+			appendStringInfoChar(buf, '*');
+		}
+		else
+		{
+			ListCell   *arg;
+			bool		first = true;
+
+			/* Add all the arguments */
+			foreach(arg, node->args)
+			{
+				TargetEntry *tle = (TargetEntry *) lfirst(arg);
+				Node	   *n = (Node *) tle->expr;
+
+				if (tle->resjunk)
+					continue;
+
+				if (!first)
+					appendStringInfoString(buf, ", ");
+				first = false;
+
+				/* Add VARIADIC */
+#if PG_VERSION_NUM < 130000
+				if (use_variadic && lnext(arg) == NULL)
+#else
+				if (use_variadic && lnext(node->args, arg) == NULL)
+#endif
+					appendStringInfoString(buf, "VARIADIC ");
+
+				multicorn_deparse_expr((Expr *) n, context);
+			}
+		}
+
+		/* Add ORDER BY */
+		if (node->aggorder != NIL)
+		{
+			appendStringInfoString(buf, " ORDER BY ");
+			// multicorn_append_agg_order_by(node->aggorder, node->args, context);
+		}
+	}
+
+	/* Add FILTER (WHERE ..) */
+	if (node->aggfilter != NULL)
+	{
+		appendStringInfoString(buf, ") FILTER (WHERE ");
+		multicorn_deparse_expr((Expr *) node->aggfilter, context);
+	}
+
+	appendStringInfoChar(buf, ')');
+}
+
+/*
+ * multicorn_append_function_name
+ *		Deparses function name from given function oid.
+ */
+static void
+multicorn_append_function_name(Oid funcid, deparse_expr_cxt *context)
+{
+	StringInfo	buf = context->buf;
+	HeapTuple	proctup;
+	Form_pg_proc procform;
+	const char *proname;
+
+	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+	if (!HeapTupleIsValid(proctup))
+		elog(ERROR, "cache lookup failed for function %u", funcid);
+	procform = (Form_pg_proc) GETSTRUCT(proctup);
+
+	/* Always print the function name */
+	proname = NameStr(procform->proname);
+	appendStringInfoString(buf, quote_identifier(proname));
+	if (context->aggref)
+		appendStringInfoString(context->aggref->aggname, quote_identifier(proname));
+
+	ReleaseSysCache(proctup);
 }

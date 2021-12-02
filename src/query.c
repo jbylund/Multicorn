@@ -73,13 +73,8 @@ extractColumns(List *reltargetlist, List *restrictinfolist)
         Node *node = (Node *)lfirst(lc);
 
         targetcolumns = pull_var_clause(node,
-#if PG_VERSION_NUM >= 90600
                                         PVC_RECURSE_AGGREGATES |
-                                            PVC_RECURSE_PLACEHOLDERS);
-#else
-                                        PVC_RECURSE_AGGREGATES,
                                         PVC_RECURSE_PLACEHOLDERS);
-#endif
         columns = list_union(columns, targetcolumns);
         i++;
     }
@@ -89,13 +84,8 @@ extractColumns(List *reltargetlist, List *restrictinfolist)
         RestrictInfo *node = (RestrictInfo *)lfirst(lc);
 
         targetcolumns = pull_var_clause((Node *)node->clause,
-#if PG_VERSION_NUM >= 90600
                                         PVC_RECURSE_AGGREGATES |
-                                            PVC_RECURSE_PLACEHOLDERS);
-#else
-                                        PVC_RECURSE_AGGREGATES,
                                         PVC_RECURSE_PLACEHOLDERS);
-#endif
         columns = list_union(columns, targetcolumns);
     }
     return columns;
