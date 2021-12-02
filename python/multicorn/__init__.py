@@ -280,7 +280,7 @@ class ForeignDataWrapper(object):
         """
         return []
 
-    def execute(self, quals, columns, sortkeys=None):
+    def execute(self, quals, columns, sortkeys=None, aggs=None):
         """Execute a query in the foreign data wrapper.
 
         This method is called at the first iteration.

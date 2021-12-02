@@ -902,12 +902,7 @@ execute(ForeignScanState *node, ExplainState *es)
             newqual->base.opname = qual->opname;
             newqual->base.isArray = qual->isArray;
             newqual->base.useOr = qual->useOr;
-
-#if PG_VERSION_NUM >= 100000
             newqual->value = ExecEvalExpr(expr_state, econtext, &isNull);
-#else
-            newqual->value = ExecEvalExpr(expr_state, econtext, &isNull, NULL);
-#endif
             newqual->base.typeoid = ((Param *)((MulticornParamQual *)qual)->expr)->paramtype;
             newqual->isnull = isNull;
             break;
@@ -944,6 +939,17 @@ execute(ForeignScanState *node, ExplainState *es)
         if (PyList_Size(p_pathkeys) > 0)
         {
             PyDict_SetItemString(kwargs, "sortkeys", p_pathkeys);
+        }
+        if (state->aggref)
+        {
+            PyObject *aggs = PyDict_New();
+            PyObject *operation, *column;
+            operation = PyUnicode_FromString(state->aggref->aggname->data);
+            column = PyUnicode_FromString(state->aggref->columnname->data);
+
+            PyDict_SetItemString(aggs, "operation", operation);
+            PyDict_SetItemString(aggs, "column", column);
+            PyDict_SetItemString(kwargs, "aggs", aggs);
         }
         if (es != NULL)
         {

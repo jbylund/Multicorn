@@ -754,6 +754,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
      */
     rel = RelationIdGetRelation(execstate->foreigntableid);
     desc = RelationGetDescr(rel);
+    execstate->tupdesc = desc;
     attinmeta = TupleDescGetAttInMetadata(desc);
 	initConversioninfo(execstate->cinfos, attinmeta);
 	// initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc));
@@ -1011,6 +1012,8 @@ multicornIterateForeignScan(ForeignScanState *node)
 {
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	MulticornExecState *execstate = node->fdw_state;
+    // TupleTableSlot *slot = execstate->tupdesc;
+    // TupleTableSlot *slot = ExecAllocTableSlot(node->ss.ps.state, execstate->tupdesc, node->ss.ss_ScanTupleSlot->tts_ops);
 	PyObject   *p_value;
 	MemoryContext oldcontext;
 
