@@ -482,19 +482,17 @@ multicornGetForeignPlan(PlannerInfo *root,
                         Plan *outer_plan
 )
 {
-	Index		scan_relid = foreignrel->relid;
 	MulticornPlanState *planstate = (MulticornPlanState *) foreignrel->fdw_private;
+    Index		scan_relid = foreignrel->relid;
 	List	   *remote_exprs = NIL;
 	List	   *local_exprs = NIL;
+    List	   *params_list = NIL;
 	List	   *fdw_scan_tlist = NIL;
 	List	   *fdw_recheck_quals = NIL;
-	ListCell   *lc;
+    List	   *retrieved_attrs;
     StringInfoData sql;
     bool    has_limit = false;
-    List	   *params_list = NIL;
-	List	   *retrieved_attrs;
-
-	best_path->path.pathtarget->width = planstate->width;
+    ListCell   *lc;
 
     if (IS_SIMPLE_REL(foreignrel))
 	{
@@ -637,9 +635,21 @@ multicornGetForeignPlan(PlannerInfo *root,
 		}
 	}
 
-    planstate->pathkeys = (List *) best_path->fdw_private;
-	/* Remember remote_exprs for possible use by postgresPlanDirectModify */
+    /*
+	 * Build the query string to be sent for execution, and identify
+	 * expressions to be sent as parameters.
+     * NB: Atm only used for extracting agg operation and column names and
+     * serialize them for execution stage
+	 */
+    initStringInfo(&sql);
+    multicorn_deparse_select(&sql, root, foreignrel, best_path->path.pathkeys,
+                             &retrieved_attrs, &params_list, fdw_scan_tlist, has_limit);
+
+    /* Remember remote_exprs for possible use by postgresPlanDirectModify */
 	planstate->final_remote_exprs = remote_exprs;
+
+    best_path->path.pathtarget->width = planstate->width;
+    planstate->pathkeys = (List *) best_path->fdw_private;
 
     scan_clauses = extract_actual_clauses(scan_clauses, false);
     /* Extract the quals coming from a parameterized path, if any */
@@ -652,12 +662,6 @@ multicornGetForeignPlan(PlannerInfo *root,
 								&planstate->qual_list);
 		}
 	}
-
-    /* hacky deparse aggr info (inspired by deparse select from GridDBFdw) */
-    initStringInfo(&sql);
-    multicorn_deparse_select(&sql, root, foreignrel,
-                        best_path->path.pathkeys,
-                        &retrieved_attrs, &params_list, fdw_scan_tlist, has_limit);
 
 	/*
 	 * Create the ForeignScan node for the given relation.
@@ -968,7 +972,7 @@ static void subscanEnd(ForeignScanState *node)
 }
 
 /*
- * Read a single row from the subscan relatio
+ * Read a single row from the subscan relation
  */
 static bool subscanReadRow(TupleTableSlot *slot, Relation subscanRel, void *subscanState)
 {
@@ -1012,8 +1016,6 @@ multicornIterateForeignScan(ForeignScanState *node)
 {
 	TupleTableSlot *slot = node->ss.ss_ScanTupleSlot;
 	MulticornExecState *execstate = node->fdw_state;
-    // TupleTableSlot *slot = execstate->tupdesc;
-    // TupleTableSlot *slot = ExecAllocTableSlot(node->ss.ps.state, execstate->tupdesc, node->ss.ss_ScanTupleSlot->tts_ops);
 	PyObject   *p_value;
 	MemoryContext oldcontext;
 
@@ -1684,8 +1686,7 @@ multicorn_merge_fdw_options(MulticornPlanState *fpinfo,
 	fpinfo->use_remote_estimate = fpinfo_o->use_remote_estimate;
 	fpinfo->fetch_size = fpinfo_o->fetch_size;
 
-    fpinfo->table = fpinfo_o->table;
-	fpinfo->server = fpinfo_o->server;
+    /* Multicorn specific options */
     fpinfo->fdw_instance = fpinfo_o->fdw_instance;
     fpinfo->foreigntableid = fpinfo_o->foreigntableid;
 	fpinfo->numattrs = fpinfo_o->numattrs;
@@ -1732,9 +1733,8 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	MulticornPlanState *fpinfo = (MulticornPlanState *) grouped_rel->fdw_private;
     PathTarget *grouping_target = grouped_rel->reltarget;
     // Q: Or perhaps like in SQLite FDW `PathTarget *grouping_target = root->upper_targets[UPPERREL_GROUP_AGG];`?
-    // A: It appears they are the same thing
+    // A: It appears they are the same thing; see also GridDBs sortgrouprefs explanation
 	MulticornPlanState *ofpinfo;
-	List	   *aggvars;
 	ListCell   *lc;
 	int			i;
 	List	   *tlist = NIL;
@@ -1760,6 +1760,15 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	 * server.  All GROUP BY expressions will be part of the grouping target
 	 * and thus there is no need to search for them separately.  Add grouping
 	 * expressions into target list which will be passed to foreign server.
+     *
+     * A tricky fine point is that we must not put any expression into the
+	 * target list that is just a foreign param (that is, something that
+	 * deparse.c would conclude has to be sent to the foreign server).  If we
+	 * do, the expression will also appear in the fdw_exprs list of the plan
+	 * node, and setrefs.c will get confused and decide that the fdw_exprs
+	 * entry is actually a reference to the fdw_scan_tlist entry, resulting in
+	 * a broken plan.  Somewhat oddly, it's OK if the expression contains such
+	 * a node, as long as it's not at top level; then no match is possible.
 	 */
 	i = 0;
 	foreach(lc, grouping_target->exprs)
@@ -1774,7 +1783,7 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 			TargetEntry *tle;
 
 			/*
-			 * If any of the GROUP BY expression is not shippable we can not
+			 * If any GROUP BY expression is not shippable, then we cannot
 			 * push down aggregation to the foreign server.
 			 */
 			if (!multicorn_is_foreign_expr(root, grouped_rel, expr))
@@ -1801,32 +1810,42 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 		}
 		else
 		{
-			/* Check entire expression whether it is pushable or not */
+			/*
+			 * Non-grouping expression we need to compute.  Can we ship it
+			 * as-is to the foreign server?
+			 */
 			if (multicorn_is_foreign_expr(root, grouped_rel, expr) &&
 				!multicorn_is_foreign_param(root, grouped_rel, expr))
 			{
-				/* Pushable, add to tlist */
+				/* Yes, so add to tlist as-is; OK to suppress duplicates */
 				tlist = add_to_flat_tlist(tlist, list_make1(expr));
 			}
 			else
 			{
-				/* Not matched exactly, pull the var with aggregates then */
+				/* Not pushable as a whole; extract its Vars and aggregates */
+                List	   *aggvars;
+
 				aggvars = pull_var_clause((Node *) expr,
 										  PVC_INCLUDE_AGGREGATES);
 
+                /*
+				 * If any aggregate expression is not shippable, then we
+				 * cannot push down aggregation to the foreign server.  (We
+				 * don't have to check is_foreign_param, since that certainly
+				 * won't return true for any such expression.)
+				 */
 				if (!multicorn_is_foreign_expr(root, grouped_rel, (Expr *) aggvars))
 					return false;
 
 				/*
-				 * Add aggregates, if any, into the targetlist.  Plain var
-				 * nodes should be either same as some GROUP BY expression or
-				 * part of some GROUP BY expression. In later case, the query
-				 * cannot refer plain var nodes without the surrounding
-				 * expression.  In both the cases, they are already part of
+				 * Add aggregates, if any, into the targetlist.  Plain Vars
+				 * outside an aggregate can be ignored, because they should be
+				 * either same as some GROUP BY column or part of some GROUP
+				 * BY expression.  In either case, they are already part of
 				 * the targetlist and thus no need to add them again.  In fact
-				 * adding pulled plain var nodes in SELECT clause will cause
-				 * an error on the foreign server if they are not same as some
-				 * GROUP BY expression.
+				 * including plain Vars in the tlist when they do not match a
+				 * GROUP BY column would cause the foreign server to complain
+				 * that the shipped query is invalid.
 				 */
 				foreach(l, aggvars)
 				{
@@ -1842,14 +1861,15 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	}
 
 	/*
+     * TODO: Determine whether foreign data source supports HAVING-like clauses from Python
 	 * Classify the pushable and non-pushable having clauses and save them in
 	 * remote_conds and local_conds of the grouped rel's fpinfo.
 	 */
-	if (root->hasHavingQual && query->havingQual)
+	if (havingQual)
 	{
 		ListCell   *lc;
 
-		foreach(lc, (List *) query->havingQual)
+		foreach(lc, (List *) havingQual)
 		{
 			Expr	   *expr = (Expr *) lfirst(lc);
 			RestrictInfo *rinfo;
@@ -1859,7 +1879,6 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 			 * RestrictInfos, so we must make our own.
 			 */
 			Assert(!IsA(expr, RestrictInfo));
-
 			rinfo = make_restrictinfo(
 #if PG_VERSION_NUM >= 140000
 									  root,
@@ -1906,7 +1925,8 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 			 * If aggregates within local conditions are not safe to push
 			 * down, then we cannot push down the query.  Vars are already
 			 * part of GROUP BY clause which are checked above, so no need to
-			 * access them again here.
+			 * access them again here.  Again, we need not check
+			 * is_foreign_param for a foreign aggregate.
 			 */
 			if (IsA(expr, Aggref))
 			{
@@ -1938,10 +1958,11 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	fpinfo->fdw_tuple_cost = ofpinfo->fdw_tuple_cost;
 
 	/*
-	 * Set cached relation costs to some negative value, so that we can detect
-	 * when they are set to some sensible costs, during one (usually the
-	 * first) of the calls to multicorn_estimate_path_cost_size().
+	 * Set # of retrieved rows and cached relation costs to some negative
+	 * value, so that we can detect when they are set to some sensible values,
+	 * during one (usually the first) of the calls to multicorn_estimate_path_cost_size.
 	 */
+	fpinfo->retrieved_rows = -1;
 	fpinfo->rel_startup_cost = -1;
 	fpinfo->rel_total_cost = -1;
 
@@ -2009,7 +2030,8 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
  */
 static void
 multicorn_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
-								     RelOptInfo *grouped_rel,GroupPathExtraData *extra
+								     RelOptInfo *grouped_rel,
+                                     GroupPathExtraData *extra
 )
 {
 	Query	   *parse = root->parse;
@@ -2036,9 +2058,17 @@ multicorn_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
 	 * Copy foreign table, foreign server, user mapping, shippable extensions
 	 * etc. details from the input relation's fpinfo.
 	 */
+    fpinfo->table = ifpinfo->table;
+	fpinfo->server = ifpinfo->server;
+	fpinfo->user = ifpinfo->user;
     multicorn_merge_fdw_options(fpinfo, ifpinfo, NULL);
 
-    /* Assess if it is safe to push down aggregation and grouping. */
+    /*
+	 * Assess if it is safe to push down aggregation and grouping.
+	 *
+	 * Use HAVING qual from extra. In case of child partition, it will have
+	 * translated Vars.
+	 */
 	if (!multicorn_foreign_grouping_ok(root, grouped_rel, extra->havingQual))
     	return;
 
@@ -2083,9 +2113,12 @@ serializePlanState(MulticornPlanState * state)
 
 	result = lappend(result, serializeDeparsedSortGroup(state->pathkeys));
 
-    result = lappend(result, makeString(state->aggref->aggname->data));
+    if (state->aggref)
+    {
+        result = lappend(result, makeString(state->aggref->aggname->data));
 
-	result = lappend(result, makeString(state->aggref->columnname->data));
+	    result = lappend(result, makeString(state->aggref->columnname->data));
+    }
 
 	return result;
 }
@@ -2115,11 +2148,16 @@ initializeExecState(void *internalstate)
 	execstate->nulls = palloc(attnum * sizeof(bool));
 	execstate->subscanRel = NULL;
 	execstate->subscanState = NULL;
-    execstate->aggref = palloc0(sizeof(MulticornAggref));
-    execstate->aggref->aggname = makeStringInfo();
-    execstate->aggref->aggname->data = strVal(list_nth(values, 4));
-    execstate->aggref->columnname = makeStringInfo();
-    execstate->aggref->columnname->data = strVal(list_nth(values, 5));
+
+    if (list_length(values) > 4)
+    {
+        execstate->aggref = palloc0(sizeof(MulticornAggref));
+        execstate->aggref->aggname = makeStringInfo();
+        execstate->aggref->aggname->data = strVal(list_nth(values, 4));
+        execstate->aggref->columnname = makeStringInfo();
+        execstate->aggref->columnname->data = strVal(list_nth(values, 5));
+    }
+
     execstate->foreigntableid = foreigntableid;
 	return execstate;
 }
