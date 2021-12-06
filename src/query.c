@@ -95,15 +95,25 @@ extractColumns(List *reltargetlist, List *restrictinfolist)
  * Initialize the array of "ConversionInfo" elements, needed to convert python
  * objects back to suitable postgresql data structures.
  */
-void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta)
+void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List *column_names)
 {
-    int i;
+    int i, ind = 0;
 
     for (i = 0; i < attinmeta->tupdesc->natts; i++)
     {
         Form_pg_attribute attr = TupleDescAttr(attinmeta->tupdesc, i);
         Oid outfuncoid;
         bool typIsVarlena;
+
+        /* Hacky way to make sure that cinfos order matches that of
+         * tts_tupleDescriptor inside scan state, as initialized by
+         * ExecInitForeignScan.
+         */
+        char *attrname = NameStr(attr->attname);
+        if (column_names && !list_member(column_names, makeString(attrname)))
+        {
+            continue;
+        }
 
         if (!attr->attisdropped)
         {
@@ -116,16 +126,17 @@ void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta)
             cinfo->atttypmod = attinmeta->atttypmods[i];
             cinfo->attioparam = attinmeta->attioparams[i];
             cinfo->attinfunc = &attinmeta->attinfuncs[i];
-            cinfo->attrname = NameStr(attr->attname);
+            cinfo->attrname = attrname;
             cinfo->attnum = i + 1;
             cinfo->attndims = attr->attndims;
             cinfo->need_quote = false;
-            cinfos[i] = cinfo;
+            cinfos[ind] = cinfo;
         }
         else
         {
-            cinfos[i] = NULL;
+            cinfos[ind] = NULL;
         }
+        ind++;
     }
 }
 

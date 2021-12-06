@@ -353,7 +353,8 @@ void extractRestrictions(Relids base_relids,
 					List **quals);
 List	   *extractColumns(List *reltargetlist, List *restrictinfolist);
 void initConversioninfo(ConversionInfo ** cinfo,
-		AttInMetadata *attinmeta);
+		AttInMetadata *attinmeta,
+        List *column_names);
 
 Value *colnameFromVar(Var *var, PlannerInfo *root,
 		MulticornPlanState * state);

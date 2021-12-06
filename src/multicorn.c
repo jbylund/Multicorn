@@ -316,7 +316,7 @@ multicornGetForeignRelSize(PlannerInfo *root,
 
 		planstate->cinfos = palloc0(sizeof(ConversionInfo *) *
 									planstate->numattrs);
-		initConversioninfo(planstate->cinfos, attinmeta);
+		initConversioninfo(planstate->cinfos, attinmeta, NULL);
 		/*
 		 * needWholeRow = rel->trigdesc && rel->trigdesc->trig_insert_after_row;
 		 *
@@ -729,6 +729,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	{
 		execstate->rel = node->ss.ss_currentRelation;
 		execstate->tupdesc = RelationGetDescr(execstate->rel);
+        initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), NULL);
 	}
 	else
 	{
@@ -738,6 +739,23 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 #else
 		execstate->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 #endif
+        /* Setup to re-initialize conversion info correctly, since extracting it
+        * from TupleDescGetAttInMetadata(execstate->tupdesc) doesn't work in case
+        * of aggregation.
+        *
+        * The reason for that is that in multicorn_foreign_grouping_ok we trim the
+        * grouped_tlist for aggregation (common for all FDWs for some reason), and
+        * this in turn gets re-used to init the tts_tupleDescriptor in
+        * ExecInitForeignScan with no reference to original attnum.
+        *
+        * The workaround is to pass the parsed column list (a List of String nodes)
+        * and then skip all columns not present there, so as to match the cinfos
+        * with the slot's tts_tupleDescriptor.
+        */
+        rel = RelationIdGetRelation(execstate->foreigntableid);
+        desc = RelationGetDescr(rel);
+        attinmeta = TupleDescGetAttInMetadata(desc);
+        initConversioninfo(execstate->cinfos, attinmeta, execstate->target_list);
 	}
 
 	execstate->values = palloc(sizeof(Datum) * execstate->tupdesc->natts);
@@ -749,19 +767,6 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 							((Expr *) lfirst(lc)),
 							&execstate->qual_list);
 	}
-
-    /* Setup to re-initialize conversion info as in the planning phase, since
-     * extracting it from TupleDescGetAttInMetadata(execstate->tupdesc) doesn't
-     * work in case of aggregation. The reason for that is that in grouped_tlist
-     * we strip the relname's inside of multicorn_foreign_grouping_ok for some
-     * reason.
-     */
-    rel = RelationIdGetRelation(execstate->foreigntableid);
-    desc = RelationGetDescr(rel);
-    execstate->tupdesc = desc;
-    attinmeta = TupleDescGetAttInMetadata(desc);
-	initConversioninfo(execstate->cinfos, attinmeta);
-	// initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc));
 
 	execstate->subscanCxt = AllocSetContextCreate(
 		node->ss.ps.state->es_query_cxt,
@@ -1325,7 +1330,7 @@ multicornBeginForeignModify(ModifyTableState *mtstate,
 	modstate->buffer = makeStringInfo();
 	modstate->fdw_instance = getInstance(rel->rd_id);
 	modstate->rowidAttrName = getRowIdColumn(modstate->fdw_instance);
-	initConversioninfo(modstate->cinfos, TupleDescGetAttInMetadata(desc));
+	initConversioninfo(modstate->cinfos, TupleDescGetAttInMetadata(desc), NULL);
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
 	MemoryContextSwitchTo(oldcontext);
 	if (ps->ps_ResultTupleSlot)
@@ -1334,7 +1339,7 @@ multicornBeginForeignModify(ModifyTableState *mtstate,
 
 		modstate->resultCinfos = palloc0(sizeof(ConversionInfo *) *
 										 resultTupleDesc->natts);
-		initConversioninfo(modstate->resultCinfos, TupleDescGetAttInMetadata(resultTupleDesc));
+		initConversioninfo(modstate->resultCinfos, TupleDescGetAttInMetadata(resultTupleDesc), NULL);
 	}
 	for (i = 0; i < desc->natts; i++)
 	{
