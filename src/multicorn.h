@@ -244,6 +244,10 @@ typedef struct MulticornExecState
      */
 	List *agg_operations;
     List *agg_column_names;
+    /* Aggregation keys composed out of ops, cols and order number for parsing
+     * the result.
+     */
+    List *agg_keys;
     /* To be used to regenerate cinfos */
     Oid			foreigntableid;
 }	MulticornExecState;

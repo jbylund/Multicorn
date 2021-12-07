@@ -717,9 +717,9 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
 	MulticornExecState *execstate;
 	ListCell   *lc;
-    Relation	rel;
-    TupleDesc	desc;
-    AttInMetadata *attinmeta;
+    StringInfo agg_key;
+    int agg_number;
+    char *agg_number_str;
 
     execstate = initializeExecState(fscan->fdw_private);
 
@@ -741,7 +741,33 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 #else
 		execstate->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 #endif
-        initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), execstate->target_list);
+        /*
+         * Setup mapping between aggregation properties (operation and column)
+         * and a key that will be used to extract the returned result during scan.
+         */
+        ListCell *lc_op, *lc_col;
+
+        agg_number = 0;
+        forboth(lc_op, execstate->agg_operations, lc_col, execstate->agg_column_names)
+        {
+            agg_key = makeStringInfo();
+            initStringInfo(agg_key);
+
+            appendStringInfoString(agg_key, strVal(lfirst(lc_op)));
+            appendStringInfoString(agg_key, "_");
+            appendStringInfoString(agg_key, strVal(lfirst(lc_col)));
+            appendStringInfoString(agg_key, "_");
+
+            agg_number_str = (char *) palloc(7);
+            pg_itoa(agg_number, agg_number_str);
+            appendStringInfoString(agg_key, agg_number_str);
+
+            execstate->agg_keys = lappend(execstate->agg_keys, makeString(agg_key->data));
+
+            pfree(agg_number_str);
+            agg_number++;
+        }
+        initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), execstate->agg_keys);
 	}
 
 	execstate->values = palloc(sizeof(Datum) * execstate->tupdesc->natts);

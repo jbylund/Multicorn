@@ -943,19 +943,21 @@ execute(ForeignScanState *node, ExplainState *es)
         }
         if (state->agg_operations)
         {
-            PyObject *aggs = PyList_New(0);
-            ListCell *lc_op, *lc_col;
+            PyObject *aggs = PyDict_New();
+            ListCell *lc_op, *lc_col, *lc_key;
 
-            forboth(lc_op, state->agg_operations, lc_col, state->agg_column_names)
+            forthree(lc_op, state->agg_operations,
+                     lc_col, state->agg_column_names,
+                     lc_key, state->agg_keys)
             {
-                PyObject *aggregation = PyDict_New();
+                PyObject *agg = PyDict_New();
                 PyObject *operation = PyUnicode_FromString(strVal(lfirst(lc_op)));
                 PyObject *column = PyUnicode_FromString(strVal(lfirst(lc_col)));
 
-                PyDict_SetItemString(aggregation, "operation", operation);
-                PyDict_SetItemString(aggregation, "column", column);
-                PyList_Append(aggs, aggregation);
-                Py_DECREF(aggregation);
+                PyDict_SetItemString(agg, "operation", operation);
+                PyDict_SetItemString(agg, "column", column);
+                PyDict_SetItemString(aggs, strVal(lfirst(lc_key)), agg);
+                Py_DECREF(agg);
                 Py_DECREF(operation);
                 Py_DECREF(column);
             }

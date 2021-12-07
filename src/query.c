@@ -95,7 +95,7 @@ extractColumns(List *reltargetlist, List *restrictinfolist)
  * Initialize the array of "ConversionInfo" elements, needed to convert python
  * objects back to suitable postgresql data structures.
  */
-void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List *column_names)
+void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List *agg_keys)
 {
     int i;
 
@@ -110,9 +110,9 @@ void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List 
          * ExecInitForeignScan.
          */
         char *attrname = NameStr(attr->attname);
-        if (column_names)
+        if (agg_keys)
         {
-            attrname = strVal(list_nth(column_names, i));
+            attrname = strVal(list_nth(agg_keys, i));
         }
 
         if (!attr->attisdropped)
