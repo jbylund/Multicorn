@@ -491,7 +491,7 @@ multicornGetForeignPlan(PlannerInfo *root,
 	List	   *fdw_recheck_quals = NIL;
     List	   *retrieved_attrs;
     StringInfoData sql;
-    bool    has_limit = false;
+    bool    has_limit = false, has_final_sort = false;
     ListCell   *lc;
 
     if (IS_SIMPLE_REL(foreignrel))
@@ -639,11 +639,13 @@ multicornGetForeignPlan(PlannerInfo *root,
 	 * Build the query string to be sent for execution, and identify
 	 * expressions to be sent as parameters.
      * NB: Atm only used for extracting agg operation and column names and
-     * serialize them for execution stage
+     * serialize them for execution stage.
 	 */
     initStringInfo(&sql);
-    multicorn_deparse_select(&sql, root, foreignrel, best_path->path.pathkeys,
-                             &retrieved_attrs, &params_list, fdw_scan_tlist, has_limit);
+    multicorn_deparse_select_stmt_for_rel(&sql, root, foreignrel, fdw_scan_tlist,
+									      remote_exprs, best_path->path.pathkeys,
+									      has_final_sort, has_limit, false,
+									      &retrieved_attrs, &params_list);
 
     /* Remember remote_exprs for possible use by postgresPlanDirectModify */
 	planstate->final_remote_exprs = remote_exprs;
@@ -2118,12 +2120,9 @@ serializePlanState(MulticornPlanState * state)
 
 	result = lappend(result, serializeDeparsedSortGroup(state->pathkeys));
 
-    if (state->aggref)
-    {
-        result = lappend(result, makeString(state->aggref->aggname->data));
+    result = lappend(result, state->agg_operations);
 
-	    result = lappend(result, makeString(state->aggref->columnname->data));
-    }
+    result = lappend(result, state->agg_column_names);
 
 	return result;
 }
@@ -2153,16 +2152,8 @@ initializeExecState(void *internalstate)
 	execstate->nulls = palloc(attnum * sizeof(bool));
 	execstate->subscanRel = NULL;
 	execstate->subscanState = NULL;
-
-    if (list_length(values) > 4)
-    {
-        execstate->aggref = palloc0(sizeof(MulticornAggref));
-        execstate->aggref->aggname = makeStringInfo();
-        execstate->aggref->aggname->data = strVal(list_nth(values, 4));
-        execstate->aggref->columnname = makeStringInfo();
-        execstate->aggref->columnname->data = strVal(list_nth(values, 5));
-    }
-
+    execstate->agg_operations = list_nth(values, 4);
+    execstate->agg_column_names = list_nth(values, 5);
     execstate->foreigntableid = foreigntableid;
 	return execstate;
 }

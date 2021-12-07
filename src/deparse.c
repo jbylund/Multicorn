@@ -73,11 +73,15 @@ typedef struct foreign_loc_cxt
 	FDWCollateState state;		/* state of current collation choice */
 } foreign_loc_cxt;
 
+static void multicorn_deparse_select(List *tlist,
+                                     bool is_subquery,
+                                     List **retrieved_attrs,
+                                     deparse_expr_cxt *context);
 static void multicorn_deparse_expr(Expr *node, deparse_expr_cxt *context);
 static void multicorn_deparse_var(Var *node, deparse_expr_cxt *context);
 static void multicorn_deparse_aggref(Aggref *node, deparse_expr_cxt *context);
 static void multicorn_append_function_name(Oid funcid, deparse_expr_cxt *context);
-static void multicorn_deparse_explicit_targetList(List *tlist,
+static void multicorn_deparse_explicit_target_list(List *tlist,
                                     bool is_returning,
                                     List **retrieved_attrs,
                                     deparse_expr_cxt *context);
@@ -89,7 +93,8 @@ static void multicorn_deparse_explicit_targetList(List *tlist,
  * For a base relation fpinfo->attrs_used is used to construct SELECT clause,
  * hence the tlist is ignored for a base relation.
  *
- * remote_conds is the list of conditions to be deparsed as WHERE clause.
+ * remote_conds is the list of conditions to be deparsed into the WHERE clause
+ * (or, in the case of upper relations, into the HAVING clause).
  *
  * If params_list is not NULL, it receives a list of Params and other-relation
  * Vars used in the clauses; these values must be transmitted to the remote
@@ -100,94 +105,150 @@ static void multicorn_deparse_explicit_targetList(List *tlist,
  *
  * pathkeys is the list of pathkeys to order the result by.
  *
+ * is_subquery is the flag to indicate whether to deparse the specified
+ * relation as a subquery.
+ *
  * List of columns selected is returned in retrieved_attrs.
  */
 void
-multicorn_deparse_select(StringInfo buf,
-                        PlannerInfo *root,
-                        RelOptInfo *baserel,
-                        // List *remote_conds,
-                        List *pathkeys,
-                        List **retrieved_attrs,
-                        List **params_list,
-                        List *tlist,
-                        bool has_limit)
+multicorn_deparse_select_stmt_for_rel(StringInfo buf, PlannerInfo *root, RelOptInfo *rel,
+						List *tlist, List *remote_conds, List *pathkeys,
+						bool has_final_sort, bool has_limit, bool is_subquery,
+						List **retrieved_attrs, List **params_list)
 {
-	RangeTblEntry *rte;
-	Relation	rel;
-	MulticornPlanState *fpinfo = (MulticornPlanState *) baserel->fdw_private;
 	deparse_expr_cxt context;
-	MulticornAggref *aggref;
+	MulticornPlanState *fpinfo = (MulticornPlanState *) rel->fdw_private;
 	// List	   *quals;
 
-	/* Fill portions of context common to join and base relation */
+	/*
+	 * We handle relations for foreign tables, joins between those and upper
+	 * relations.
+	 */
+	Assert(IS_JOIN_REL(rel) ||
+		   IS_SIMPLE_REL(rel) ||
+		   IS_OTHER_REL(rel) ||
+		   IS_UPPER_REL(rel));
+
+	/* Fill portions of context common to upper, join and base relation */
 	context.buf = buf;
 	context.root = root;
-	context.foreignrel = baserel;
+	context.foreignrel = rel;
 	context.params_list = params_list;
-	context.scanrel = IS_UPPER_REL(baserel) ? fpinfo->outerrel : baserel;
-	aggref = palloc0(sizeof(MulticornAggref));
-	aggref->columnname = makeStringInfo();
-	aggref->aggname = makeStringInfo();
-	context.aggref = aggref;
+	context.scanrel = IS_UPPER_REL(rel) ? fpinfo->outerrel : rel;
 	context.can_skip_cast = false;
+    context.agg_operations = NIL;
+    context.agg_column_names = NIL;
 
-	rte = planner_rt_fetch(context.scanrel->relid, root);
-
-	/*
-	 * Core code already has some lock on each rel being planned, so we can
-	 * use NoLock here.
-	 */
-	rel = table_open(rte->relid, NoLock);
-
-	appendStringInfoString(buf, "SELECT ");
-	if (IS_UPPER_REL(baserel) || fpinfo->is_tlist_func_pushdown == true)
-	{
-		multicorn_deparse_explicit_targetList(tlist, false, retrieved_attrs, &context);
-		fpinfo->aggref = context.aggref;
-	}
-	// else
-	// {
-	// 	multicorn_deparse_target_list(buf, root, baserel->relid, rel,
-	// 							   fpinfo->attrs_used, retrieved_attrs);
-	// }
-
-	// /*
-	//  * Construct FROM clause
-	//  */
-	// appendStringInfoString(buf, " FROM ");
-	// multicorn_deparse_relation(buf, rel);
+	/* Construct SELECT clause */
+	multicorn_deparse_select(tlist, is_subquery, retrieved_attrs, &context);
+    fpinfo->agg_operations = context.agg_operations;
+    fpinfo->agg_column_names = context.agg_column_names;
 
 	// /*
 	//  * For upper relations, the WHERE clause is built from the remote
 	//  * conditions of the underlying scan relation; otherwise, we can use the
 	//  * supplied list of remote conditions directly.
 	//  */
-	// if (IS_UPPER_REL(baserel))
+	// if (IS_UPPER_REL(rel))
 	// {
-	// 	multicornFdwRelationInfo *ofpinfo;
+	// 	MulticornPlanState *ofpinfo;
 
-	// 	ofpinfo = (multicornFdwRelationInfo *) fpinfo->outerrel->fdw_private;
+	// 	ofpinfo = (MulticornPlanState *) fpinfo->outerrel->fdw_private;
 	// 	quals = ofpinfo->remote_conds;
 	// }
 	// else
 	// 	quals = remote_conds;
 
-	// /*
-	//  * Construct WHERE clause
-	//  */
-	// if (quals)
-	// 	multicorn_append_where_clause(quals, &context);
+	// /* Construct FROM and WHERE clauses */
+	// multicorn_deparse_from_expr(quals, &context);
+
+	// if (IS_UPPER_REL(rel))
+	// {
+	// 	/* Append GROUP BY clause */
+	// 	multicorn_append_group_by_clause(tlist, &context);
+
+	// 	/* Append HAVING clause */
+	// 	if (remote_conds)
+	// 	{
+	// 		appendStringInfoString(buf, " HAVING ");
+	// 		multicorn_append_conditions(remote_conds, &context);
+	// 	}
+	// }
 
 	// /* Add ORDER BY clause if we found any useful pathkeys */
 	// if (pathkeys)
-	// 	multicorn_append_order_by_clause(pathkeys, &context);
+	// 	multicorn_append_order_by_clause(pathkeys, has_final_sort, &context);
 
 	// /* Add LIMIT clause if necessary */
 	// if (has_limit)
 	// 	multicorn_append_limit_clause(&context);
 
-	table_close(rel, NoLock);
+	// /* Add any necessary FOR UPDATE/SHARE. */
+	// multicorn_deparse_locking_clause(&context);
+}
+
+/*
+ * Construct a simple SELECT statement that retrieves desired columns
+ * of the specified foreign table, and append it to "buf".  The output
+ * contains just "SELECT ... ".
+ *
+ * We also create an integer List of the columns being retrieved, which is
+ * returned to *retrieved_attrs, unless we deparse the specified relation
+ * as a subquery.
+ *
+ * tlist is the list of desired columns.  is_subquery is the flag to
+ * indicate whether to deparse the specified relation as a subquery.
+ * Read prologue of multicorn_deparse_select_stmt_for_rel() for details.
+ */
+static void
+multicorn_deparse_select(List *tlist, bool is_subquery, List **retrieved_attrs,
+                         deparse_expr_cxt *context)
+{
+    StringInfo	buf = context->buf;
+	RelOptInfo *foreignrel = context->foreignrel;
+	PlannerInfo *root = context->root;
+	MulticornPlanState *fpinfo = (MulticornPlanState *) foreignrel->fdw_private;
+
+    /*
+	 * Construct SELECT list
+	 */
+	appendStringInfoString(buf, "SELECT ");
+
+    // if (is_subquery)
+	// {
+	// 	/*
+	// 	 * For a relation that is deparsed as a subquery, emit expressions
+	// 	 * specified in the relation's reltarget.  Note that since this is for
+	// 	 * the subquery, no need to care about *retrieved_attrs.
+	// 	 */
+	// 	multicorn_deparse_subquery_target_list(context);
+	// }
+	if (IS_JOIN_REL(foreignrel) || IS_UPPER_REL(foreignrel) || fpinfo->is_tlist_func_pushdown == true)
+	{
+        /*
+		 * For a join or upper relation the input tlist gives the list of
+		 * columns required to be fetched from the foreign server.
+		 */
+		multicorn_deparse_explicit_target_list(tlist, false, retrieved_attrs, context);
+	}
+	// else
+	// {
+    //     /*
+	// 	 * For a base relation fpinfo->attrs_used gives the list of columns
+	// 	 * required to be fetched from the foreign server.
+	// 	 */
+	// 	RangeTblEntry *rte = planner_rt_fetch(foreignrel->relid, root);
+
+    //     /*
+	// 	 * Core code already has some lock on each rel being planned, so we
+	// 	 * can use NoLock here.
+	// 	 */
+	// 	Relation	rel = table_open(rte->relid, NoLock);
+
+    //     multicorn_deparse_target_list(buf, root, foreignrel->relid, rel,
+	// 							      fpinfo->attrs_used, retrieved_attrs);
+	// 	table_close(rel, NoLock);
+	// }
 }
 
 /*
@@ -1195,15 +1256,11 @@ multicorn_deparse_column_ref(StringInfo buf, int varno, int varattno, deparse_ex
 			);
 
 	appendStringInfoString(buf, quote_identifier(colname));
-	if (context->aggref)
-	{
-		if (strcmp(context->aggref->columnname->data, "") == 0)
-			appendStringInfoString(context->aggref->columnname, colname);
-	}
+    context->agg_column_names = lappend(context->agg_column_names, makeString(colname));
 }
 
 static void
-multicorn_deparse_explicit_targetList(List *tlist,
+multicorn_deparse_explicit_target_list(List *tlist,
 								      bool is_returning,
 								      List **retrieved_attrs,
 								      deparse_expr_cxt *context)
@@ -1335,10 +1392,6 @@ multicorn_deparse_aggref(Aggref *node, deparse_expr_cxt *context)
 {
 	StringInfo	buf = context->buf;
 	bool		use_variadic;
-	MulticornAggref *aggref = context->aggref;
-
-	initStringInfo(aggref->aggname);
-	initStringInfo(aggref->columnname);
 
 	/* Only basic, non-split aggregation accepted. */
 	Assert(node->aggsplit == AGGSPLIT_SIMPLE);
@@ -1449,8 +1502,7 @@ multicorn_append_function_name(Oid funcid, deparse_expr_cxt *context)
 	/* Always print the function name */
 	proname = NameStr(procform->proname);
 	appendStringInfoString(buf, quote_identifier(proname));
-	if (context->aggref)
-		appendStringInfoString(context->aggref->aggname, quote_identifier(proname));
+    context->agg_operations = lappend(context->agg_operations, makeString(proname));
 
 	ReleaseSysCache(proctup);
 }

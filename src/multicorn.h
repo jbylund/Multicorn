@@ -75,17 +75,6 @@ enum FdwPathPrivateIndex
 };
 
 /*
- * Struct for parsing and storing aggregation details, top be passed between
- * planning and execution phases.
- *
- */
-typedef struct MulticornAggref
-{
-	StringInfo	aggname;
-	StringInfo	columnname;
-}   MulticornAggref;
-
-/*
  * Context for multicorn_deparse_expr
  */
 typedef struct deparse_expr_cxt
@@ -99,7 +88,9 @@ typedef struct deparse_expr_cxt
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
 	bool		can_skip_cast;	/* outer function can skip int2/int4/int8/float4/float8 cast */
-	MulticornAggref *aggref;
+
+	List *agg_operations;
+    List *agg_column_names;
 } deparse_expr_cxt;
 
 /*
@@ -127,8 +118,11 @@ typedef struct MulticornPlanState
 	 */
 	int width;
 
-    /* Aggregate function information (inspired by GridDBFdw)*/
-	MulticornAggref *aggref;
+    /* In case the query contains aggregations, the lists below detail which
+     * functions correspond to which columns (list elements are String nodes).
+     */
+	List *agg_operations;
+    List *agg_column_names;
 
     /*
 	 * True means that the relation can be pushed down. Always true for simple
@@ -245,8 +239,11 @@ typedef struct MulticornExecState
 								 * for a foreign join scan. */
 	TupleDesc	tupdesc;		/* tuple descriptor of scan */
 
-    /* Aggregate function information (inspired by GridDBFdw)*/
-	MulticornAggref *aggref;
+    /* In case the query contains aggregations, the lists below detail which
+     * functions correspond to which columns (list elements are String nodes).
+     */
+	List *agg_operations;
+    List *agg_column_names;
     /* To be used to regenerate cinfos */
     Oid			foreigntableid;
 }	MulticornExecState;
@@ -375,15 +372,12 @@ PyObject   *datumToPython(Datum node, Oid typeoid, ConversionInfo * cinfo);
 List	*serializeDeparsedSortGroup(List *pathkeys);
 List	*deserializeDeparsedSortGroup(List *items);
 extern List *multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel);
-extern void multicorn_deparse_select(StringInfo buf,
-                        PlannerInfo *root,
-                        RelOptInfo *baserel,
-                        // List *remote_conds,
-                        List *pathkeys,
-                        List **retrieved_attrs,
-                        List **params_list,
-                        List *tlist,
-                        bool has_limit);
+extern void multicorn_deparse_select_stmt_for_rel(StringInfo buf, PlannerInfo *root,
+                        RelOptInfo *foreignrel, List *tlist,
+                        List *remote_conds, List *pathkeys,
+                        bool has_final_sort, bool has_limit,
+                        bool is_subquery,
+                        List **retrieved_attrs, List **params_list);
 
 #endif   /* PG_MULTICORN_H */
 

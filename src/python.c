@@ -5,6 +5,7 @@
 #include "catalog/pg_user_mapping.h"
 #include "access/reloptions.h"
 #include "miscadmin.h"
+#include "nodes/value.h"
 #include "utils/numeric.h"
 #include "utils/date.h"
 #include "utils/timestamp.h"
@@ -940,16 +941,27 @@ execute(ForeignScanState *node, ExplainState *es)
         {
             PyDict_SetItemString(kwargs, "sortkeys", p_pathkeys);
         }
-        if (state->aggref)
+        if (state->agg_operations)
         {
-            PyObject *aggs = PyDict_New();
-            PyObject *operation, *column;
-            operation = PyUnicode_FromString(state->aggref->aggname->data);
-            column = PyUnicode_FromString(state->aggref->columnname->data);
+            PyObject *aggs = PyList_New(0);
+            ListCell *lc_op, *lc_col;
 
-            PyDict_SetItemString(aggs, "operation", operation);
-            PyDict_SetItemString(aggs, "column", column);
+            forboth(lc_op, state->agg_operations, lc_col, state->agg_column_names)
+            {
+                PyObject *aggregation = PyDict_New();
+                PyObject *operation = PyUnicode_FromString(strVal(lfirst(lc_op)));
+                PyObject *column = PyUnicode_FromString(strVal(lfirst(lc_col)));
+
+                PyDict_SetItemString(aggregation, "operation", operation);
+                PyDict_SetItemString(aggregation, "column", column);
+                PyList_Append(aggs, aggregation);
+                Py_DECREF(aggregation);
+                Py_DECREF(operation);
+                Py_DECREF(column);
+            }
+
             PyDict_SetItemString(kwargs, "aggs", aggs);
+            Py_DECREF(aggs);
         }
         if (es != NULL)
         {
