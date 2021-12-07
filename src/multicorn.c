@@ -741,23 +741,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 #else
 		execstate->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 #endif
-        /* Setup to re-initialize conversion info correctly, since extracting it
-        * from TupleDescGetAttInMetadata(execstate->tupdesc) doesn't work in case
-        * of aggregation.
-        *
-        * The reason for that is that in multicorn_foreign_grouping_ok we trim the
-        * grouped_tlist for aggregation (common for all FDWs for some reason), and
-        * this in turn gets re-used to init the tts_tupleDescriptor in
-        * ExecInitForeignScan with no reference to original attnum.
-        *
-        * The workaround is to pass the parsed column list (a List of String nodes)
-        * and then skip all columns not present there, so as to match the cinfos
-        * with the slot's tts_tupleDescriptor.
-        */
-        rel = RelationIdGetRelation(execstate->foreigntableid);
-        desc = RelationGetDescr(rel);
-        attinmeta = TupleDescGetAttInMetadata(desc);
-        initConversioninfo(execstate->cinfos, attinmeta, execstate->target_list);
+        initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), execstate->target_list);
 	}
 
 	execstate->values = palloc(sizeof(Datum) * execstate->tupdesc->natts);

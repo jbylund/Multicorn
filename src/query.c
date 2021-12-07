@@ -97,7 +97,7 @@ extractColumns(List *reltargetlist, List *restrictinfolist)
  */
 void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List *column_names)
 {
-    int i, ind = 0;
+    int i;
 
     for (i = 0; i < attinmeta->tupdesc->natts; i++)
     {
@@ -110,9 +110,9 @@ void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List 
          * ExecInitForeignScan.
          */
         char *attrname = NameStr(attr->attname);
-        if (column_names && !list_member(column_names, makeString(attrname)))
+        if (column_names)
         {
-            continue;
+            attrname = strVal(list_nth(column_names, i));
         }
 
         if (!attr->attisdropped)
@@ -130,13 +130,12 @@ void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List 
             cinfo->attnum = i + 1;
             cinfo->attndims = attr->attndims;
             cinfo->need_quote = false;
-            cinfos[ind] = cinfo;
+            cinfos[i] = cinfo;
         }
         else
         {
-            cinfos[ind] = NULL;
+            cinfos[i] = NULL;
         }
-        ind++;
     }
 }
 
