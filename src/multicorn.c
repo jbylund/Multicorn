@@ -1840,42 +1840,11 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	}
 
 	/*
-     * TODO: Determine whether foreign data source supports HAVING-like clauses from Python
-	 * Classify the pushable and non-pushable having clauses and save them in
-	 * remote_conds and local_conds of the grouped rel's fpinfo.
+     * TODO: Enable HAVING clause pushdowns
 	 */
 	if (havingQual)
 	{
-		ListCell   *lc;
-
-		foreach(lc, (List *) havingQual)
-		{
-			Expr	   *expr = (Expr *) lfirst(lc);
-			RestrictInfo *rinfo;
-
-			/*
-			 * Currently, the core code doesn't wrap havingQuals in
-			 * RestrictInfos, so we must make our own.
-			 */
-			Assert(!IsA(expr, RestrictInfo));
-			rinfo = make_restrictinfo(
-#if PG_VERSION_NUM >= 140000
-									  root,
-#endif
-									  expr,
-									  true,
-									  false,
-									  false,
-									  root->qual_security_level,
-									  grouped_rel->relids,
-									  NULL,
-									  NULL);
-			if (multicorn_is_foreign_expr(root, grouped_rel, expr))
-				fpinfo->remote_conds = lappend(fpinfo->remote_conds, rinfo);
-			else
-				fpinfo->local_conds = lappend(fpinfo->local_conds, rinfo);
-
-		}
+		return false
 	}
 
 	/*
