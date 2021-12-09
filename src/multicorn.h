@@ -88,9 +88,6 @@ typedef struct deparse_expr_cxt
 	StringInfo	buf;			/* output buffer to append to */
 	List	  **params_list;	/* exprs that will become remote Params */
 	bool		can_skip_cast;	/* outer function can skip int2/int4/int8/float4/float8 cast */
-
-	List *agg_operations;
-    List *agg_column_names;
 } deparse_expr_cxt;
 
 /*
@@ -118,11 +115,13 @@ typedef struct MulticornPlanState
 	 */
 	int width;
 
-    /* In case the query contains aggregations, the lists below detail which
-     * functions correspond to which columns (list elements are String nodes).
+    /*
+     * Aggregation and grouping data to be passed to the execution phase.
+     * See MulticornExecState for more details.
      */
-	List *agg_operations;
-    List *agg_column_names;
+    List *upper_rel_targets;
+	List *aggs;
+	List *group_clauses;
 
     /*
 	 * True means that the relation can be pushed down. Always true for simple
@@ -153,19 +152,6 @@ typedef struct MulticornPlanState
 	Cost		fdw_tuple_cost;
 	List	   *shippable_extensions;	/* OIDs of whitelisted extensions */
 
-	/* Bitmap of attr numbers we need to fetch from the remote server. */
-	Bitmapset  *attrs_used;
-
-	/* True means that the query_pathkeys is safe to push down */
-	bool		qp_is_pushdown_safe;
-
-	/* Cost and selectivity of local_conds. */
-	QualCost	local_conds_cost;
-	Selectivity local_conds_sel;
-
-	/* Selectivity of join conditions */
-	Selectivity joinclause_sel;
-
 	/* Join information */
 	RelOptInfo *outerrel;
 	RelOptInfo *innerrel;
@@ -191,23 +177,6 @@ typedef struct MulticornPlanState
 
 	/* Grouping information */
 	List	   *grouped_tlist;
-
-	/* Subquery information */
-	bool		make_outerrel_subquery; /* do we deparse outerrel as a
-										 * subquery? */
-	bool		make_innerrel_subquery; /* do we deparse innerrel as a
-										 * subquery? */
-	Relids		lower_subquery_rels;	/* all relids appearing in lower
-										 * subqueries */
-
-	/*
-	 * Index of the relation.  It is used to create an alias to a subquery
-	 * representing the relation.
-	 */
-	int			relation_index;
-
-	/* Function pushdown support in target list */
-	bool		is_tlist_func_pushdown;
 }	MulticornPlanState;
 
 typedef struct MulticornExecState
@@ -239,17 +208,24 @@ typedef struct MulticornExecState
 								 * for a foreign join scan. */
 	TupleDesc	tupdesc;		/* tuple descriptor of scan */
 
-    /* In case the query contains aggregations, the lists below detail which
-     * functions correspond to which columns (list elements are String nodes).
+    /*
+     * List containing targets to be returned from Python in case of aggregations.
+     * List elements are aggregation keys or group_clauses elements.
      */
-	List *agg_operations;
-    List *agg_column_names;
-    /* Aggregation keys composed out of ops, cols and order number for parsing
-     * the result.
+    List *upper_rel_targets;
+    /*
+     * In case the query contains aggregations, the lists below details which
+     * functions correspond to which columns.
+     * List elements are themselves Lists of String nodes, denoting agg key,
+     * operation and column names, respectively. The agg key corresponds to the
+     * upper_rel_targets list entries.
      */
-    List *agg_keys;
-    /* To be used to regenerate cinfos */
-    Oid			foreigntableid;
+	List *aggs;
+    /*
+     * List containing GROUP BY information.
+     * List elements are column names for grouping.
+     */
+	List *group_clauses;
 }	MulticornExecState;
 
 typedef struct MulticornModifyState
@@ -357,8 +333,7 @@ void initConversioninfo(ConversionInfo ** cinfo,
 		AttInMetadata *attinmeta,
         List *column_names);
 
-Value *colnameFromVar(Var *var, PlannerInfo *root,
-		MulticornPlanState * state);
+Value *colnameFromVar(Var *var, PlannerInfo *root);
 
 void computeDeparsedSortGroup(List *deparsed, MulticornPlanState *planstate,
 		List **apply_pathkeys,
@@ -376,12 +351,7 @@ PyObject   *datumToPython(Datum node, Oid typeoid, ConversionInfo * cinfo);
 List	*serializeDeparsedSortGroup(List *pathkeys);
 List	*deserializeDeparsedSortGroup(List *items);
 extern List *multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel);
-extern void multicorn_deparse_select_stmt_for_rel(StringInfo buf, PlannerInfo *root,
-                        RelOptInfo *foreignrel, List *tlist,
-                        List *remote_conds, List *pathkeys,
-                        bool has_final_sort, bool has_limit,
-                        bool is_subquery,
-                        List **retrieved_attrs, List **params_list);
+extern void multicorn_extract_upper_rel_info(PlannerInfo *root, List *tlist, MulticornPlanState *fpinfo);
 
 #endif   /* PG_MULTICORN_H */
 

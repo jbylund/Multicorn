@@ -370,7 +370,7 @@ multicornGetForeignRelSize(PlannerInfo *root,
 			 * Store only a Value node containing the string name of the
 			 * column.
 			 */
-			colname = colnameFromVar(var, root, planstate);
+			colname = colnameFromVar(var, root);
 			if (colname != NULL && strVal(colname) != NULL)
 			{
 				planstate->target_list = lappend(planstate->target_list, colname);
@@ -490,8 +490,6 @@ multicornGetForeignPlan(PlannerInfo *root,
 	List	   *fdw_scan_tlist = NIL;
 	List	   *fdw_recheck_quals = NIL;
     List	   *retrieved_attrs;
-    StringInfoData sql;
-    bool    has_limit = false, has_final_sort = false;
     ListCell   *lc;
 
     if (IS_SIMPLE_REL(foreignrel))
@@ -635,18 +633,6 @@ multicornGetForeignPlan(PlannerInfo *root,
 		}
 	}
 
-    /*
-	 * Build the query string to be sent for execution, and identify
-	 * expressions to be sent as parameters.
-     * NB: Atm only used for extracting agg operation and column names and
-     * serialize them for execution stage.
-	 */
-    initStringInfo(&sql);
-    multicorn_deparse_select_stmt_for_rel(&sql, root, foreignrel, fdw_scan_tlist,
-									      remote_exprs, best_path->path.pathkeys,
-									      has_final_sort, has_limit, false,
-									      &retrieved_attrs, &params_list);
-
     /* Remember remote_exprs for possible use by postgresPlanDirectModify */
 	planstate->final_remote_exprs = remote_exprs;
 
@@ -664,6 +650,11 @@ multicornGetForeignPlan(PlannerInfo *root,
 								&planstate->qual_list);
 		}
 	}
+
+    if (IS_UPPER_REL(foreignrel))
+    {
+        multicorn_extract_upper_rel_info(root, fdw_scan_tlist, planstate);
+    }
 
 	/*
 	 * Create the ForeignScan node for the given relation.
@@ -717,9 +708,6 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
 	MulticornExecState *execstate;
 	ListCell   *lc;
-    StringInfo agg_key;
-    int agg_number;
-    char *agg_number_str;
 
     execstate = initializeExecState(fscan->fdw_private);
 
@@ -741,33 +729,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 #else
 		execstate->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 #endif
-        /*
-         * Setup mapping between aggregation properties (operation and column)
-         * and a key that will be used to extract the returned result during scan.
-         */
-        ListCell *lc_op, *lc_col;
-
-        agg_number = 0;
-        forboth(lc_op, execstate->agg_operations, lc_col, execstate->agg_column_names)
-        {
-            agg_key = makeStringInfo();
-            initStringInfo(agg_key);
-
-            appendStringInfoString(agg_key, strVal(lfirst(lc_op)));
-            appendStringInfoString(agg_key, "_");
-            appendStringInfoString(agg_key, strVal(lfirst(lc_col)));
-            appendStringInfoString(agg_key, "_");
-
-            agg_number_str = (char *) palloc(7);
-            pg_itoa(agg_number, agg_number_str);
-            appendStringInfoString(agg_key, agg_number_str);
-
-            execstate->agg_keys = lappend(execstate->agg_keys, makeString(agg_key->data));
-
-            pfree(agg_number_str);
-            agg_number++;
-        }
-        initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), execstate->agg_keys);
+        initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), execstate->upper_rel_targets);
 	}
 
 	execstate->values = palloc(sizeof(Datum) * execstate->tupdesc->natts);
@@ -2130,9 +2092,11 @@ serializePlanState(MulticornPlanState * state)
 
 	result = lappend(result, serializeDeparsedSortGroup(state->pathkeys));
 
-    result = lappend(result, state->agg_operations);
+    result = lappend(result, state->upper_rel_targets);
 
-    result = lappend(result, state->agg_column_names);
+    result = lappend(result, state->aggs);
+
+    result = lappend(result, state->group_clauses);
 
 	return result;
 }
@@ -2162,8 +2126,8 @@ initializeExecState(void *internalstate)
 	execstate->nulls = palloc(attnum * sizeof(bool));
 	execstate->subscanRel = NULL;
 	execstate->subscanState = NULL;
-    execstate->agg_operations = list_nth(values, 4);
-    execstate->agg_column_names = list_nth(values, 5);
-    execstate->foreigntableid = foreigntableid;
+    execstate->upper_rel_targets = list_nth(values, 4);
+    execstate->aggs = list_nth(values, 5);
+    execstate->group_clauses = list_nth(values, 6);
 	return execstate;
 }

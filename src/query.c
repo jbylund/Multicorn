@@ -95,7 +95,7 @@ extractColumns(List *reltargetlist, List *restrictinfolist)
  * Initialize the array of "ConversionInfo" elements, needed to convert python
  * objects back to suitable postgresql data structures.
  */
-void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List *agg_keys)
+void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List *upper_rel_targets)
 {
     int i;
 
@@ -105,14 +105,16 @@ void initConversioninfo(ConversionInfo **cinfos, AttInMetadata *attinmeta, List 
         Oid outfuncoid;
         bool typIsVarlena;
 
-        /* Hacky way to make sure that cinfos order matches that of
-         * tts_tupleDescriptor inside scan state, as initialized by
-         * ExecInitForeignScan.
-         */
         char *attrname = NameStr(attr->attname);
-        if (agg_keys)
+
+        if (upper_rel_targets)
         {
-            attrname = strVal(list_nth(agg_keys, i));
+            /*
+            * For aggregations/groupings the targets lack attname, so we instead
+            * refer to the targets through references generated in
+            * multicorn_extract_upper_rel_info().
+            */
+            attrname = strVal(list_nth(upper_rel_targets, i));
         }
 
         if (!attr->attisdropped)
@@ -418,7 +420,7 @@ void extractClauseFromNullTest(Relids base_relids,
  *	Returns a "Value" node containing the string name of the column from a var.
  */
 Value *
-colnameFromVar(Var *var, PlannerInfo *root, MulticornPlanState *planstate)
+colnameFromVar(Var *var, PlannerInfo *root)
 {
     RangeTblEntry *rte = rte = planner_rt_fetch(var->varno, root);
     char *attname = get_attname(rte->relid, var->varattno);
