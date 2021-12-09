@@ -280,7 +280,7 @@ class ForeignDataWrapper(object):
         """
         return []
 
-    def execute(self, quals, columns, sortkeys=None):
+    def execute(self, quals, columns, sortkeys=None, aggs=None, group_clauses=None):
         """Execute a query in the foreign data wrapper.
 
         This method is called at the first iteration.
@@ -311,8 +311,15 @@ class ForeignDataWrapper(object):
                 You should return AT LEAST those columns when returning a
                 dict. If returning a sequence, every column from the table
                 should be in the sequence.
+
+        Kwargs:
             sortkeys (list): A list of :class:`SortKey`
                 that the FDW said it can enforce.
+            aggs (dict): A dictionary mapping aggregation key with function and
+                column to be used in the aggregation operation. Result should be
+                returned under the provided aggregation key.
+            group_clauses (list): A list of columns used in GROUP BY statements.
+                The result should be returned for each column name provided.
 
         Returns:
             An iterable of python objects which can be converted back to PostgreSQL.

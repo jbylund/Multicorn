@@ -969,6 +969,45 @@ execute(ForeignScanState *node, ExplainState *es)
 		if(PyList_Size(p_pathkeys) > 0){
 			PyDict_SetItemString(kwargs, "sortkeys", p_pathkeys);
 		}
+                if (state->aggs)
+        {
+            PyObject *aggs = PyDict_New();
+            ListCell *lc_agg;
+            List *agg_list;
+
+            foreach(lc_agg, state->aggs)
+            {
+                PyObject *agg = PyDict_New();
+                
+                agg_list = (List *)lfirst(lc_agg);
+                PyObject *function = PyUnicode_FromString(strVal(lsecond(agg_list)));
+                PyObject *column = PyUnicode_FromString(strVal(lthird(agg_list)));
+
+                PyDict_SetItemString(agg, "function", function);
+                PyDict_SetItemString(agg, "column", column);
+                PyDict_SetItemString(aggs, strVal(linitial(agg_list)), agg);
+                Py_DECREF(agg);
+                Py_DECREF(function);
+                Py_DECREF(column);
+            }
+
+            PyDict_SetItemString(kwargs, "aggs", aggs);
+            Py_DECREF(aggs);
+        }
+        if (state->group_clauses)
+        {
+            PyObject *group_clauses = PyList_New(0);
+            ListCell *lc_groupc;
+
+            foreach(lc_groupc, state->group_clauses)
+            {
+                PyObject *column = PyUnicode_FromString(strVal(lfirst(lc_groupc)));
+                PyList_Append(group_clauses, column);
+            }
+
+            PyDict_SetItemString(kwargs, "group_clauses", group_clauses);
+            Py_DECREF(group_clauses);
+        }
 		if(es != NULL){
 			PyObject * verbose;
 			if(es->verbose){

@@ -107,7 +107,7 @@ extractColumns(List *reltargetlist, List *restrictinfolist)
  * objects back to suitable postgresql data structures.
  */
 void
-initConversioninfo(ConversionInfo ** cinfos, AttInMetadata *attinmeta)
+initConversioninfo(ConversionInfo ** cinfos, AttInMetadata *attinmeta, List *upper_rel_targets)
 {
 	int			i;
 
@@ -117,7 +117,17 @@ initConversioninfo(ConversionInfo ** cinfos, AttInMetadata *attinmeta)
 		Oid			outfuncoid;
 		bool		typIsVarlena;
 
+        char *attrname = NameStr(attr->attname);
 
+        if (upper_rel_targets)
+        {
+            /*
+            * For aggregations/groupings the targets lack attname, so we instead
+            * refer to the targets through references generated in
+            * multicorn_extract_upper_rel_info().
+            */
+            attrname = strVal(list_nth(upper_rel_targets, i));
+        }
 
 		if (!attr->attisdropped)
 		{
@@ -130,7 +140,7 @@ initConversioninfo(ConversionInfo ** cinfos, AttInMetadata *attinmeta)
 			cinfo->atttypmod = attinmeta->atttypmods[i];
 			cinfo->attioparam = attinmeta->attioparams[i];
 			cinfo->attinfunc = &attinmeta->attinfuncs[i];
-			cinfo->attrname = NameStr(attr->attname);
+			cinfo->attrname = attrname;
 			cinfo->attnum = i + 1;
 			cinfo->attndims = attr->attndims;
 			cinfo->need_quote = false;
@@ -438,7 +448,7 @@ extractClauseFromNullTest(Relids base_relids,
  *	Returns a "Value" node containing the string name of the column from a var.
  */
 Value *
-colnameFromVar(Var *var, PlannerInfo *root, MulticornPlanState * planstate)
+colnameFromVar(Var *var, PlannerInfo *root)
 {
 	RangeTblEntry *rte = rte = planner_rt_fetch(var->varno, root);
 	char	   *attname = get_attname(rte->relid, var->varattno);
