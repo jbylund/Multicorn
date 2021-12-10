@@ -212,6 +212,21 @@ class ForeignDataWrapper(object):
         """
         return []
 
+    def can_pushdown_upperrel(self):
+        """
+        Method called from the planner to ask the FDW whether it supports upper
+        relation pushdown (i.e. aggregation, grouping, etc.), and if so return
+        a data structure with appropriate details.
+
+        The FDW has to inspect every sort, and respond which one are handled.
+        The sorts are cumulatives.
+
+        Return:
+            None if pushdown not supported, otherwise a dictionary containing
+            more granular details for the planning phase, in the form:
+        """
+        return None
+
     def get_path_keys(self):
         u"""
         Method called from the planner to add additional Path to the planner.

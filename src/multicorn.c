@@ -307,6 +307,7 @@ multicornGetForeignRelSize(PlannerInfo *root,
 
     /* Base foreign tables need to be push down always. */
 	planstate->pushdown_safe = true;
+    planstate->groupby_supported = false;
 
 	planstate->fdw_instance = getInstance(foreigntableid);
 	planstate->foreigntableid = foreigntableid;
@@ -1795,6 +1796,13 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 		{
 			TargetEntry *tle;
 
+            /*
+			 * Ensure GROUP BY clauses are shippable at all by the corresponding
+             * Python FDW instance.
+			 */
+            if (!fpinfo->groupby_supported)
+                return false;
+
 			/*
 			 * If any GROUP BY expression is not shippable, then we cannot
 			 * push down aggregation to the foreign server.
@@ -1823,6 +1831,13 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 		}
 		else
 		{
+            /*
+			 * Ensure aggregation functions are shippable at all by the corresponding
+             * Python FDW instance.
+			 */
+            if (!fpinfo->agg_functions)
+                return false;
+
 			/*
 			 * Non-grouping expression we need to compute.  Can we ship it
 			 * as-is to the foreign server?
@@ -1986,6 +2001,10 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	if (stage != UPPERREL_GROUP_AGG || output_rel->fdw_private)
 		return;
 
+    /* Check with the Python FDW instance whether it supports pushdown at all */
+    if (!canPushdownUpperrel((MulticornPlanState *) input_rel->fdw_private))
+        return;
+
 	fpinfo = (MulticornPlanState *) palloc0(sizeof(MulticornPlanState));
 	fpinfo->pushdown_safe = false;
 	fpinfo->stage = stage;
@@ -2042,6 +2061,8 @@ multicorn_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
     fpinfo->table = ifpinfo->table;
 	fpinfo->server = ifpinfo->server;
 	fpinfo->user = ifpinfo->user;
+    fpinfo->groupby_supported = ifpinfo->groupby_supported;
+	fpinfo->agg_functions = ifpinfo->agg_functions;
     multicorn_merge_fdw_options(fpinfo, ifpinfo, NULL);
 
     /*

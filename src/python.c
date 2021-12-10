@@ -969,7 +969,7 @@ execute(ForeignScanState *node, ExplainState *es)
 		if(PyList_Size(p_pathkeys) > 0){
 			PyDict_SetItemString(kwargs, "sortkeys", p_pathkeys);
 		}
-                if (state->aggs)
+        if (state->aggs)
         {
             PyObject *aggs = PyDict_New();
             ListCell *lc_agg;
@@ -977,11 +977,15 @@ execute(ForeignScanState *node, ExplainState *es)
 
             foreach(lc_agg, state->aggs)
             {
-                PyObject *agg = PyDict_New();
-                
+                PyObject    *agg,
+                            *function,
+                            *column;
+
+                agg = PyDict_New();
+
                 agg_list = (List *)lfirst(lc_agg);
-                PyObject *function = PyUnicode_FromString(strVal(lsecond(agg_list)));
-                PyObject *column = PyUnicode_FromString(strVal(lthird(agg_list)));
+                function = PyUnicode_FromString(strVal(lsecond(agg_list)));
+                column = PyUnicode_FromString(strVal(lthird(agg_list)));
 
                 PyDict_SetItemString(agg, "function", function);
                 PyDict_SetItemString(agg, "column", column);
@@ -1679,6 +1683,52 @@ canSort(MulticornPlanState * state, List *deparsed)
 	Py_DECREF(p_pathkeys);
 	Py_DECREF(p_sortable);
 	return result;
+}
+
+/*
+ * Call the can_pushdown_upperrel method from the python implementation, to
+ * determine whether upper relations can be pushed down to the corresponding
+ * data source to begin with.
+ *
+ * If yes, then also initialize some fields in MulticornPlanState needed for
+ * more granular conditional logic for assesing whether the particular query
+ * is suitable for pushdown.
+ */
+bool
+canPushdownUpperrel(MulticornPlanState * state)
+{
+    PyObject    *fdw_instance = state->fdw_instance,
+                *p_upperrel_pushdown,
+                *p_object;
+	Py_ssize_t	i, size;
+    bool pushdown_upperrel = false;
+
+    p_upperrel_pushdown = PyObject_CallMethod(fdw_instance, "can_pushdown_upperrel", "()");
+    errorCheck();
+
+    if (p_upperrel_pushdown != NULL && p_upperrel_pushdown != Py_None)
+    {
+        /* Determine whether the FDW instance supports GROUP BYs */
+        p_object = PyMapping_GetItemString(p_upperrel_pushdown, "groupby_supported");
+        if (p_object != NULL && p_object != Py_None)
+		{
+            state->groupby_supported = PyObject_IsTrue(p_object);
+            Py_DECREF(p_object);
+		}
+
+        /* Determine which aggregation functions are supported */
+        p_object = PyMapping_GetItemString(p_upperrel_pushdown, "agg_functions");
+        if (p_object != NULL && p_object != Py_None)
+		{
+            state->agg_functions = PyMapping_Keys(p_object);
+            Py_DECREF(p_object);
+		}
+
+        pushdown_upperrel = true;
+    }
+
+	Py_DECREF(p_upperrel_pushdown);
+    return pushdown_upperrel;
 }
 
 PyObject *

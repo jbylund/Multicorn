@@ -122,7 +122,7 @@ multicorn_foreign_expr_walker(Node *node,
 						      foreign_loc_cxt *outer_cxt)
 {
 	bool		check_type = true;
-    //MulticornPlanState *fpinfo;
+    MulticornPlanState *fpinfo;
 	foreign_loc_cxt inner_cxt;
 	Oid			collation = InvalidOid;
 	FDWCollateState state = FDW_COLLATE_NONE;
@@ -133,8 +133,8 @@ multicorn_foreign_expr_walker(Node *node,
 	if (node == NULL)
 		return true;
 
-    /* May need server info from baserel's fdw_private struct */
-	//fpinfo = (MulticornPlanState *) (glob_cxt->foreignrel->fdw_private);
+    /* Needed to asses per-instance FDW shipability properties */
+	fpinfo = (MulticornPlanState *) (glob_cxt->foreignrel->fdw_private);
 
 	/* Set up inner_cxt for possible recursion to child nodes */
 	inner_cxt.collation = InvalidOid;
@@ -215,15 +215,9 @@ multicorn_foreign_expr_walker(Node *node,
 				if (schema != PG_CATALOG_NAMESPACE)
 					return false;
 
-				/* TODO: this decision will need to be forwarded to Python */
-				if (!(strcmp(opername, "sum") == 0
-					  || strcmp(opername, "avg") == 0
-					  || strcmp(opername, "max") == 0
-					  || strcmp(opername, "min") == 0
-					  || strcmp(opername, "count") == 0))
-				{
+				/* Make sure the specific function at hand is shippable */
+				if (!PySequence_Contains(fpinfo->agg_functions, PyUnicode_FromString(opername)))
 					return false;
-				}
 
 
 				/* Not safe to pushdown when not in grouping context */
@@ -547,6 +541,9 @@ multicorn_extract_upper_rel_info(PlannerInfo *root, List *tlist, MulticornPlanSt
             appendStringInfoString(agg_key, strVal(function));
             appendStringInfoString(agg_key, "_");
             appendStringInfoString(agg_key, strVal(colname));
+
+            // TODO: Ensure that there is no possibility of a match between agg_key
+            // a colname from a GROUP BY clause.
 
             fpinfo->aggs = lappend(fpinfo->aggs, list_make3(makeString(agg_key->data), function, colname));
             fpinfo->upper_rel_targets = lappend(fpinfo->upper_rel_targets, makeString(agg_key->data));
