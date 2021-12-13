@@ -81,6 +81,35 @@ static void multicorn_deparse_explicit_target_list(List *tlist,
                                     deparse_expr_cxt *context);
 
 /*
+ * Examine each qual clause in input_conds, and classify them into two groups,
+ * which are returned as two lists:
+ *	- remote_conds contains expressions that can be evaluated remotely
+ *	- local_conds contains expressions that can't be evaluated remotely
+ */
+void
+multicorn_classify_conditions(PlannerInfo *root,
+                    RelOptInfo *baserel,
+                    List *input_conds,
+                    List **remote_conds,
+                    List **local_conds)
+{
+	ListCell   *lc;
+
+	*remote_conds = NIL;
+	*local_conds = NIL;
+
+	foreach(lc, input_conds)
+	{
+		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+
+		if (multicorn_is_foreign_expr(root, baserel, ri->clause))
+			*remote_conds = lappend(*remote_conds, ri);
+		else
+			*local_conds = lappend(*local_conds, ri);
+	}
+}
+
+/*
  * Return true if given object is one of PostgreSQL's built-in objects.
  *
  * We use FirstBootstrapObjectId as the cutoff, so that we only consider
@@ -127,7 +156,6 @@ multicorn_foreign_expr_walker(Node *node,
 	Oid			collation = InvalidOid;
 	FDWCollateState state = FDW_COLLATE_NONE;
 	HeapTuple	tuple;
-	Form_pg_operator form;
 
 	/* Need do nothing for empty subexpressions */
 	if (node == NULL)
@@ -539,11 +567,8 @@ multicorn_extract_upper_rel_info(PlannerInfo *root, List *tlist, MulticornPlanSt
             initStringInfo(agg_key);
 
             appendStringInfoString(agg_key, strVal(function));
-            appendStringInfoString(agg_key, "_");
+            appendStringInfoString(agg_key, ".");
             appendStringInfoString(agg_key, strVal(colname));
-
-            // TODO: Ensure that there is no possibility of a match between agg_key
-            // a colname from a GROUP BY clause.
 
             fpinfo->aggs = lappend(fpinfo->aggs, list_make3(makeString(agg_key->data), function, colname));
             fpinfo->upper_rel_targets = lappend(fpinfo->upper_rel_targets, makeString(agg_key->data));

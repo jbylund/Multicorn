@@ -286,6 +286,11 @@ typedef struct MulticornDeparsedSortGroup
 } MulticornDeparsedSortGroup;
 
 /* deparse.c */
+extern void multicorn_classify_conditions(PlannerInfo *root,
+                                RelOptInfo *baserel,
+                                List *input_conds,
+                                List **remote_conds,
+                                List **local_conds);
 extern bool multicorn_is_foreign_expr(PlannerInfo *root,
 								      RelOptInfo *baserel,
 								      Expr *expr);
@@ -314,6 +319,7 @@ PyObject   *tupleTableSlotToPyObject(TupleTableSlot *slot, ConversionInfo ** cin
 char	   *getRowIdColumn(PyObject *fdw_instance);
 PyObject   *optionsListToPyDict(List *options);
 const char *getPythonEncodingName(void);
+bool canPushdownUpperrel(MulticornPlanState * state);
 
 void getRelSize(MulticornPlanState * state,
 		PlannerInfo *root,

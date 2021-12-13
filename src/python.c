@@ -1700,7 +1700,6 @@ canPushdownUpperrel(MulticornPlanState * state)
     PyObject    *fdw_instance = state->fdw_instance,
                 *p_upperrel_pushdown,
                 *p_object;
-	Py_ssize_t	i, size;
     bool pushdown_upperrel = false;
 
     p_upperrel_pushdown = PyObject_CallMethod(fdw_instance, "can_pushdown_upperrel", "()");

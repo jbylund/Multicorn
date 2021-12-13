@@ -308,6 +308,7 @@ multicornGetForeignRelSize(PlannerInfo *root,
     /* Base foreign tables need to be push down always. */
 	planstate->pushdown_safe = true;
     planstate->groupby_supported = false;
+    planstate->agg_functions = NULL;
 
 	planstate->fdw_instance = getInstance(foreigntableid);
 	planstate->foreigntableid = foreigntableid;
@@ -398,6 +399,18 @@ multicornGetForeignRelSize(PlannerInfo *root,
 							&planstate->qual_list);
 
 	}
+
+    /*
+	 * Identify which baserestrictinfo clauses can be sent to the remote
+	 * server and which can't.
+     * TODO: for now all WHERE clauses will be classified as local conditions
+     * since multicorn_foreign_expr_walker lacks T_OpExpr and T_Const cases,
+     * thus preventing pushdown. When adding support for this make sure to align
+     * the code in multicorn_extract_upper_rel_info as well.
+	 */
+	multicorn_classify_conditions(root, baserel, baserel->baserestrictinfo,
+					              &planstate->remote_conds, &planstate->local_conds);
+
 	/* Inject the "rows" and "width" attribute into the baserel */
 #if PG_VERSION_NUM >= 90600
 	getRelSize(planstate, root, &baserel->rows, &baserel->reltarget->width);
@@ -515,7 +528,7 @@ multicornGetForeignPlan(PlannerInfo *root,
 		)
 {
     MulticornPlanState *planstate = (MulticornPlanState *) foreignrel->fdw_private;
-    Index		scan_relid = foreignrel->relid;
+    Index		scan_relid;
 	List	   *remote_exprs = NIL;
 	List	   *local_exprs = NIL;
 	List	   *fdw_scan_tlist = NIL;
@@ -610,64 +623,9 @@ multicornGetForeignPlan(PlannerInfo *root,
 
 		/* Build the list of columns to be fetched from the foreign server. */
 		fdw_scan_tlist = multicorn_build_tlist_to_deparse(foreignrel);
-
-		/*
-		 * Ensure that the outer plan produces a tuple whose descriptor
-		 * matches our scan tuple slot.  Also, remove the local conditions
-		 * from outer plan's quals, lest they be evaluated twice, once by the
-		 * local plan and once by the scan.
-		 */
-		if (outer_plan)
-		{
-			ListCell   *lc;
-
-			/*
-			 * Right now, we only consider grouping and aggregation beyond
-			 * joins. Queries involving aggregates or grouping do not require
-			 * EPQ mechanism, hence should not have an outer plan here.
-			 */
-			Assert(!IS_UPPER_REL(foreignrel));
-
-			/*
-			 * First, update the plan's qual list if possible.  In some cases
-			 * the quals might be enforced below the topmost plan level, in
-			 * which case we'll fail to remove them; it's not worth working
-			 * harder than this.
-			 */
-			foreach(lc, local_exprs)
-			{
-				Node	   *qual = lfirst(lc);
-
-				outer_plan->qual = list_delete(outer_plan->qual, qual);
-
-				/*
-				 * For an inner join the local conditions of foreign scan plan
-				 * can be part of the joinquals as well.  (They might also be
-				 * in the mergequals or hashquals, but we can't touch those
-				 * without breaking the plan.)
-				 */
-				if (IsA(outer_plan, NestLoop) ||
-					IsA(outer_plan, MergeJoin) ||
-					IsA(outer_plan, HashJoin))
-				{
-					Join	   *join_plan = (Join *) outer_plan;
-
-					if (join_plan->jointype == JOIN_INNER)
-						join_plan->joinqual = list_delete(join_plan->joinqual,
-														  qual);
-				}
-			}
-
-			/*
-			 * Now fix the subplan's tlist --- this might result in inserting
-			 * a Result node atop the plan tree.
-			 */
-			outer_plan = change_plan_targetlist(outer_plan, fdw_scan_tlist,
-												best_path->path.parallel_safe);
-		}
 	}
 
-    /* Remember remote_exprs for possible use by postgresPlanDirectModify */
+    /* Remember remote_exprs for possible use by multicornPlanDirectModify */
 	planstate->final_remote_exprs = remote_exprs;
 
     best_path->path.pathtarget->width = planstate->width;
@@ -694,7 +652,7 @@ multicornGetForeignPlan(PlannerInfo *root,
 	return make_foreignscan(tlist,
 							local_exprs,
 							scan_relid,
-							scan_clauses,		/* no expressions to evaluate */
+							scan_clauses,
 							serializePlanState(planstate)
 #if PG_VERSION_NUM >= 90500
 							, fdw_scan_tlist
@@ -1889,52 +1847,16 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	}
 
 	/*
-     * TODO: Enable HAVING clause pushdowns
+     * TODO: Enable HAVING clause pushdowns.
+     * Note that certain simple HAVING clauses get transformed to WHERE clauses
+     * internally, so those will be supported. Example is a HAVING clause on a
+     * column that is also a part of the GROUP BY clause, in which case WHERE
+     * clause effectively achieves the same thing.
 	 */
 	if (havingQual)
 	{
 		return false;
 	}
-
-	/*
-	 * If there are any local conditions, pull Vars and aggregates from it and
-	 * check whether they are safe to pushdown or not.
-	 */
-	if (fpinfo->local_conds)
-	{
-		List	   *aggvars = NIL;
-		ListCell   *lc;
-
-		foreach(lc, fpinfo->local_conds)
-		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-
-			aggvars = list_concat(aggvars,
-								  pull_var_clause((Node *) rinfo->clause,
-												  PVC_INCLUDE_AGGREGATES));
-		}
-
-		foreach(lc, aggvars)
-		{
-			Expr	   *expr = (Expr *) lfirst(lc);
-
-			/*
-			 * If aggregates within local conditions are not safe to push
-			 * down, then we cannot push down the query.  Vars are already
-			 * part of GROUP BY clause which are checked above, so no need to
-			 * access them again here.  Again, we need not check
-			 * is_foreign_param for a foreign aggregate.
-			 */
-			if (IsA(expr, Aggref))
-			{
-				if (!multicorn_is_foreign_expr(root, grouped_rel, expr))
-					return false;
-
-				tlist = add_to_flat_tlist(tlist, list_make1(expr));
-			}
-		}
-	}
-
 
 	/* Store generated targetlist */
 	fpinfo->grouped_tlist = tlist;
@@ -1987,8 +1909,6 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 {
 	MulticornPlanState *fpinfo;
 
-	debug_elog("multicorn_fdw : %s", __func__);
-
 	/*
 	 * If input rel is not safe to pushdown, then simply return as we cannot
 	 * perform any post-join operations on the foreign server.
@@ -2003,7 +1923,9 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 
     /* Check with the Python FDW instance whether it supports pushdown at all */
     if (!canPushdownUpperrel((MulticornPlanState *) input_rel->fdw_private))
+    {
         return;
+    }
 
 	fpinfo = (MulticornPlanState *) palloc0(sizeof(MulticornPlanState));
 	fpinfo->pushdown_safe = false;
