@@ -523,8 +523,8 @@ multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel)
  * if there is no ressortgroupref set, we automatically assume the only other
  * option is a Aggref node type.
  * Moreover, for the Aggref node type we assume only a single element in args
- * (i.e. only aggregations over single columns, e.g. sum(column2)). In particular,
- * this is because in multicorn_foreign_expr_walker() we don't T_OpExpr case.
+ * (e.g. sum(column2)). In particular, this is because in
+ * multicorn_foreign_expr_walker() we don't have T_OpExpr case yet.
  */
 void
 multicorn_extract_upper_rel_info(PlannerInfo *root, List *tlist, MulticornPlanState *fpinfo)

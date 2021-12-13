@@ -59,22 +59,6 @@ typedef struct ConversionInfo
 	bool		need_quote;
 }	ConversionInfo;
 
-
-/*
- * This enum describes what's kept in the fdw_private list for a ForeignPath.
- * We store:
- *
- * 1) Boolean flag showing if the remote query has the final sort
- * 2) Boolean flag showing if the remote query has the LIMIT clause
- */
-enum FdwPathPrivateIndex
-{
-	/* has-final-sort flag (as an integer Value node) */
-	FdwPathPrivateHasFinalSort,
-	/* has-limit flag (as an integer Value node) */
-	FdwPathPrivateHasLimit
-};
-
 /*
  * Context for multicorn_deparse_expr
  */
