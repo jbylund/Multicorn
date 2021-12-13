@@ -159,9 +159,6 @@ typedef struct MulticornPlanState
 
 	/* Join information */
 	RelOptInfo *outerrel;
-	RelOptInfo *innerrel;
-	JoinType	jointype;
-	List	   *joinclauses;
 
 	/* Upper relation information */
 	UpperRelationKind stage;
@@ -195,25 +192,6 @@ typedef struct MulticornExecState
 	Datum	   *values;
 	bool	   *nulls;
 	ConversionInfo **cinfos;
-	/* Common buffer to avoid repeated allocations */
-	StringInfo	buffer;
-	AttrNumber	rowidAttno;
-	char	   *rowidAttrName;
-	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
-	/* State related to scanning through CStore chunks / temporarily
-	 * materialized tables
-	 */
-	MemoryContext   subscanCxt;
-	void           *subscanState;
-	Relation        subscanRel;
-	TupleTableSlot *subscanSlot;
-	AttrNumber     *subscanAttrMap;
-	uint64          tuplesRead;
-
-    Relation	rel;			/* relcache entry for the foreign table. NULL
-								 * for a foreign join scan. */
-	TupleDesc	tupdesc;		/* tuple descriptor of scan */
-
     /*
      * List containing targets to be returned from Python in case of aggregations.
      * List elements are aggregation keys or group_clauses elements.
@@ -232,6 +210,24 @@ typedef struct MulticornExecState
      * List elements are column names for grouping.
      */
 	List *group_clauses;
+	/* Common buffer to avoid repeated allocations */
+	StringInfo	buffer;
+	AttrNumber	rowidAttno;
+	char	   *rowidAttrName;
+	List	   *pathkeys; /* list of MulticornDeparsedSortGroup) */
+	/* State related to scanning through CStore chunks / temporarily
+	 * materialized tables
+	 */
+	MemoryContext   subscanCxt;
+	void           *subscanState;
+	Relation        subscanRel;
+	TupleTableSlot *subscanSlot;
+	AttrNumber     *subscanAttrMap;
+	uint64          tuplesRead;
+
+    Relation	rel;			/* relcache entry for the foreign table. NULL
+								 * for a foreign join scan. */
+	TupleDesc	tupdesc;		/* tuple descriptor of scan */
 }	MulticornExecState;
 
 typedef struct MulticornModifyState

@@ -75,10 +75,6 @@ typedef struct foreign_loc_cxt
 } foreign_loc_cxt;
 
 static Value *multicorn_deparse_function_name(Oid funcid);
-static void multicorn_deparse_explicit_target_list(List *tlist,
-                                    bool is_returning,
-                                    List **retrieved_attrs,
-                                    deparse_expr_cxt *context);
 
 /*
  * Examine each qual clause in input_conds, and classify them into two groups,
@@ -538,6 +534,7 @@ multicorn_extract_upper_rel_info(PlannerInfo *root, List *tlist, MulticornPlanSt
     Var *var;
     Value *colname, *function;
     Aggref *aggref;
+    StringInfo agg_key = makeStringInfo();
 
     foreach(lc, tlist)
     {
@@ -563,9 +560,7 @@ multicorn_extract_upper_rel_info(PlannerInfo *root, List *tlist, MulticornPlanSt
                                             PVC_RECURSE_PLACEHOLDERS));
             colname = colnameFromVar(var, root);
 
-            StringInfo agg_key = makeStringInfo();
             initStringInfo(agg_key);
-
             appendStringInfoString(agg_key, strVal(function));
             appendStringInfoString(agg_key, ".");
             appendStringInfoString(agg_key, strVal(colname));
@@ -585,7 +580,7 @@ multicorn_deparse_function_name(Oid funcid)
 {
 	HeapTuple	proctup;
 	Form_pg_proc procform;
-	const char *proname;
+	char *proname;
 
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(proctup))

@@ -529,10 +529,7 @@ multicornGetForeignPlan(PlannerInfo *root,
 {
     MulticornPlanState *planstate = (MulticornPlanState *) foreignrel->fdw_private;
     Index		scan_relid;
-	List	   *remote_exprs = NIL;
-	List	   *local_exprs = NIL;
 	List	   *fdw_scan_tlist = NIL;
-	List	   *fdw_recheck_quals = NIL;
     ListCell   *lc;
 
 #if PG_VERSION_NUM >= 90600
@@ -545,49 +542,6 @@ multicornGetForeignPlan(PlannerInfo *root,
 		 * For base relations, set scan_relid as the relid of the relation.
 		 */
 		scan_relid = foreignrel->relid;
-
-		/*
-		 * In a base-relation scan, we must apply the given scan_clauses.
-		 *
-		 * Separate the scan_clauses into those that can be executed remotely
-		 * and those that can't.  baserestrictinfo clauses that were
-		 * previously determined to be safe or unsafe by classifyConditions
-		 * are found in planstate->remote_conds and planstate->local_conds. Anything
-		 * else in the scan_clauses list will be a join clause, which we have
-		 * to check for remote-safety.
-		 *
-		 * Note: the join clauses we see here should be the exact same ones
-		 * previously examined by multicornGetForeignPaths.  Possibly it'd be
-		 * worth passing forward the classification work done then, rather
-		 * than repeating it here.
-		 *
-		 * This code must match "extract_actual_clauses(scan_clauses, false)"
-		 * except for the additional decision about remote versus local
-		 * execution.
-		 */
-		foreach(lc, scan_clauses)
-		{
-			RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-
-			/* Ignore any pseudoconstants, they're dealt with elsewhere */
-			if (rinfo->pseudoconstant)
-				continue;
-
-			if (list_member_ptr(planstate->remote_conds, rinfo))
-				remote_exprs = lappend(remote_exprs, rinfo->clause);
-			else if (list_member_ptr(planstate->local_conds, rinfo))
-				local_exprs = lappend(local_exprs, rinfo->clause);
-			else if (multicorn_is_foreign_expr(root, foreignrel, rinfo->clause))
-				remote_exprs = lappend(remote_exprs, rinfo->clause);
-			else
-				local_exprs = lappend(local_exprs, rinfo->clause);
-		}
-
-		/*
-		 * For a base-relation scan, we have to support EPQ recheck, which
-		 * should recheck all the remote quals.
-		 */
-		fdw_recheck_quals = remote_exprs;
 	}
 	else
 	{
@@ -603,30 +557,9 @@ multicornGetForeignPlan(PlannerInfo *root,
 		 */
 		Assert(!scan_clauses);
 
-		/*
-		 * Instead we get the conditions to apply from the fdw_private
-		 * structure.
-		 */
-		remote_exprs = extract_actual_clauses(planstate->remote_conds, false);
-		local_exprs = extract_actual_clauses(planstate->local_conds, false);
-
-		/*
-		 * We leave fdw_recheck_quals empty in this case, since we never need
-		 * to apply EPQ recheck clauses.  In the case of a joinrel, EPQ
-		 * recheck is handled elsewhere --- see multicornGetForeignJoinPaths().
-		 * If we're planning an upperrel (ie, remote grouping or aggregation)
-		 * then there's no EPQ to do because SELECT FOR UPDATE wouldn't be
-		 * allowed, and indeed we *can't* put the remote clauses into
-		 * fdw_recheck_quals because the unaggregated Vars won't be available
-		 * locally.
-		 */
-
 		/* Build the list of columns to be fetched from the foreign server. */
 		fdw_scan_tlist = multicorn_build_tlist_to_deparse(foreignrel);
 	}
-
-    /* Remember remote_exprs for possible use by multicornPlanDirectModify */
-	planstate->final_remote_exprs = remote_exprs;
 
     best_path->path.pathtarget->width = planstate->width;
     planstate->pathkeys = (List *) best_path->fdw_private;
@@ -650,13 +583,13 @@ multicornGetForeignPlan(PlannerInfo *root,
     }
 
 	return make_foreignscan(tlist,
-							local_exprs,
+							scan_clauses,
 							scan_relid,
 							scan_clauses,
 							serializePlanState(planstate)
 #if PG_VERSION_NUM >= 90500
 							, fdw_scan_tlist
-							, fdw_recheck_quals
+							, NIL
 							, outer_plan
 #endif
 							);
