@@ -1782,9 +1782,10 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	/*
      * TODO: Enable HAVING clause pushdowns.
      * Note that certain simple HAVING clauses get transformed to WHERE clauses
-     * internally, so those will be supported. Example is a HAVING clause on a
-     * column that is also a part of the GROUP BY clause, in which case WHERE
-     * clause effectively achieves the same thing.
+     * internally for performance reasons, i.e. smaller scan size. Example is a
+     * HAVING clause on a column that is also a part of the GROUP BY clause, in
+     * which case WHERE clause effectively achieves the same thing. In those
+     * cases the havingQual is NULL, even though root->hasHavingQual is true.
 	 */
 	if (havingQual)
 	{

@@ -252,8 +252,11 @@ multicorn_foreign_expr_walker(Node *node,
 				if (agg->aggsplit != AGGSPLIT_SIMPLE)
 					return false;
 
-                /* For now we don't push down aggregations with DISTINCT  */
-                if (agg->aggdistinct)
+                /*
+                 * For now we don't push down DISTINCT or COUNT(*) aggregations.
+                 * TODO: Enable this
+                 */
+                if (agg->aggdistinct || agg->aggstar)
                     return false;
 
 				/*
