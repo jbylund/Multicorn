@@ -252,6 +252,10 @@ multicorn_foreign_expr_walker(Node *node,
 				if (agg->aggsplit != AGGSPLIT_SIMPLE)
 					return false;
 
+                /* For now we don't push down aggregations with DISTINCT  */
+                if (agg->aggdistinct)
+                    return false;
+
 				/*
 				 * Recurse to input args. aggdirectargs, aggorder and
 				 * aggdistinct are all present in args, so no need to check
