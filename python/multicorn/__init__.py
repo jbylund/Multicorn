@@ -284,7 +284,7 @@ class ForeignDataWrapper(object):
         """
         return []
 
-    def explain(self, quals, columns, sortkeys=None, verbose=False):
+    def explain(self, quals, columns, sortkeys=None, aggs=None, group_clauses=None, verbose=False):
         """Hook called on explain.
 
         The arguments are the same as the :meth:`execute`, with the addition of

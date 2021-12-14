@@ -1818,13 +1818,6 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	fpinfo->rel_startup_cost = -1;
 	fpinfo->rel_total_cost = -1;
 
-
-	/*
-	 * Set the string describing this grouped relation to be used in EXPLAIN
-	 * output of corresponding ForeignScan.
-	 */
-    fpinfo->relation_name = NULL;
-
 	return true;
 }
 

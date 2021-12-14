@@ -154,13 +154,6 @@ typedef struct MulticornPlanState
 
 	int			fetch_size;		/* fetch size for this remote table */
 
-	/*
-	 * Name of the relation while EXPLAINing ForeignScan. It is used for join
-	 * relations but is set for all relations. For join relation, the name
-	 * indicates which foreign tables are being joined and the join type used.
-	 */
-	char	   *relation_name;
-
 	/* Grouping information */
 	List	   *grouped_tlist;
 }	MulticornPlanState;
