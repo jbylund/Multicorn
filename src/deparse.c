@@ -157,8 +157,10 @@ multicorn_foreign_expr_walker(Node *node,
 	if (node == NULL)
 		return true;
 
+    // MY CODE START
     /* Needed to asses per-instance FDW shipability properties */
 	fpinfo = (MulticornPlanState *) (glob_cxt->foreignrel->fdw_private);
+    // MY CODE END
 
 	/* Set up inner_cxt for possible recursion to child nodes */
 	inner_cxt.collation = InvalidOid;
@@ -239,9 +241,11 @@ multicorn_foreign_expr_walker(Node *node,
 				if (schema != PG_CATALOG_NAMESPACE)
 					return false;
 
+                // MY CODE START
 				/* Make sure the specific function at hand is shippable */
 				if (!list_member(fpinfo->agg_functions, makeString(opername)))
 					return false;
+                // MY CODE END
 
 				/* Not safe to pushdown when not in grouping context */
 				if (!IS_UPPER_REL(glob_cxt->foreignrel))
@@ -251,12 +255,14 @@ multicorn_foreign_expr_walker(Node *node,
 				if (agg->aggsplit != AGGSPLIT_SIMPLE)
 					return false;
 
+                // MY CODE START
                 /*
                  * For now we don't push down DISTINCT or COUNT(*) aggregations.
                  * TODO: Enable this
                  */
                 if (agg->aggdistinct || agg->aggstar)
                     return false;
+                // MY CODE END
 
 				/*
 				 * Recurse to input args. aggdirectargs, aggorder and
@@ -521,6 +527,7 @@ multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel)
 	return tlist;
 }
 
+// MY CODE START
 /*
  * Iterate through the targets and extract relveant information needed to execute
  * the aggregation and/or grouping on the remote data source through Python.
@@ -598,3 +605,4 @@ multicorn_deparse_function_name(Oid funcid)
 	ReleaseSysCache(proctup);
     return makeString(proname);
 }
+// MY CODE END
