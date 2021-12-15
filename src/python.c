@@ -1007,6 +1007,7 @@ execute(ForeignScanState *node, ExplainState *es)
             {
                 PyObject *column = PyUnicode_FromString(strVal(lfirst(lc_groupc)));
                 PyList_Append(group_clauses, column);
+                Py_DECREF(column);
             }
 
             PyDict_SetItemString(kwargs, "group_clauses", group_clauses);
@@ -1712,21 +1713,21 @@ canPushdownUpperrel(MulticornPlanState * state)
         if (p_object != NULL && p_object != Py_None)
 		{
             state->groupby_supported = PyObject_IsTrue(p_object);
-            Py_DECREF(p_object);
 		}
+        Py_XDECREF(p_object);
 
         /* Determine which aggregation functions are supported */
         p_object = PyMapping_GetItemString(p_upperrel_pushdown, "agg_functions");
         if (p_object != NULL && p_object != Py_None)
 		{
             state->agg_functions = PyMapping_Keys(p_object);
-            Py_DECREF(p_object);
 		}
+        Py_XDECREF(p_object);
 
         pushdown_upperrel = true;
     }
 
-	Py_DECREF(p_upperrel_pushdown);
+	Py_XDECREF(p_upperrel_pushdown);
     return pushdown_upperrel;
 }
 

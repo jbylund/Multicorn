@@ -218,12 +218,22 @@ class ForeignDataWrapper(object):
         relation pushdown (i.e. aggregation, grouping, etc.), and if so return
         a data structure with appropriate details.
 
-        The FDW has to inspect every sort, and respond which one are handled.
-        The sorts are cumulatives.
-
         Return:
             None if pushdown not supported, otherwise a dictionary containing
             more granular details for the planning phase, in the form:
+
+            {
+                "groupby_supported": <true_or_false>, # can be ommited if false
+                "agg_functions": {
+                    <PG_agg_func_name>: <foreign_agg_func_name>,
+                    ...
+                },
+            }
+
+            Each entry in `agg_functions` dict corresponds to a maping between
+            the name of a aggregation function in PostgreSQL, and the equivalent
+            foreign function. If no mapping exists for an aggregate function any
+            queries containing it won't be pushed down.
         """
         return None
 
@@ -334,7 +344,8 @@ class ForeignDataWrapper(object):
                 column to be used in the aggregation operation. Result should be
                 returned under the provided aggregation key.
             group_clauses (list): A list of columns used in GROUP BY statements.
-                The result should be returned for each column name provided.
+                For each column provided the returned response should have a
+                corresponding value in each row using that column name as the key.
 
         Returns:
             An iterable of python objects which can be converted back to PostgreSQL.
