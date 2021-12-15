@@ -240,9 +240,8 @@ multicorn_foreign_expr_walker(Node *node,
 					return false;
 
 				/* Make sure the specific function at hand is shippable */
-				if (!PySequence_Contains(fpinfo->agg_functions, PyUnicode_FromString(opername)))
+				if (!list_member(fpinfo->agg_functions, makeString(opername)))
 					return false;
-
 
 				/* Not safe to pushdown when not in grouping context */
 				if (!IS_UPPER_REL(glob_cxt->foreignrel))

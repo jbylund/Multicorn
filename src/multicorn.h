@@ -102,9 +102,9 @@ typedef struct MulticornPlanState
 
     /* Details about upperrel pushdown fetched from the Python FDW instance */
     bool groupby_supported;
-    PyObject *agg_functions;
+    List *agg_functions;
 
-        /*
+    /*
      * Aggregation and grouping data to be passed to the execution phase.
      * See MulticornExecState for more details.
      */

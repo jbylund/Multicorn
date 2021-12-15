@@ -1700,7 +1700,15 @@ canPushdownUpperrel(MulticornPlanState * state)
 {
     PyObject    *fdw_instance = state->fdw_instance,
                 *p_upperrel_pushdown,
-                *p_object;
+                *p_object,
+                *p_agg_funcs,
+                *p_agg_func,
+                *p_item;
+    Py_ssize_t	i,
+				size,
+                strlength;
+    char	   *tempbuffer;
+    StringInfo agg_func;
     bool pushdown_upperrel = false;
 
     p_upperrel_pushdown = PyObject_CallMethod(fdw_instance, "can_pushdown_upperrel", "()");
@@ -1720,7 +1728,26 @@ canPushdownUpperrel(MulticornPlanState * state)
         p_object = PyMapping_GetItemString(p_upperrel_pushdown, "agg_functions");
         if (p_object != NULL && p_object != Py_None)
 		{
-            state->agg_functions = PyMapping_Keys(p_object);
+            p_agg_funcs = PyMapping_Keys(p_object);
+            size = PySequence_Size(p_agg_funcs);
+
+            for (i = 0; i < size; i++)
+            {
+                agg_func = makeStringInfo();
+                strlength = 0;
+
+                p_item = PySequence_GetItem(p_agg_funcs, i);
+                p_agg_func = PyUnicode_AsEncodedString(p_item, getPythonEncodingName(), NULL);
+                errorCheck();
+                PyBytes_AsStringAndSize(p_agg_func, &tempbuffer, &strlength);
+                appendBinaryStringInfo(agg_func, tempbuffer, strlength);
+
+                state->agg_functions = lappend(state->agg_functions, makeString(agg_func->data));
+
+                Py_DECREF(p_agg_func);
+                Py_DECREF(p_item);
+            }
+            Py_DECREF(p_agg_funcs);
 		}
         Py_XDECREF(p_object);
 
