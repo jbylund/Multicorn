@@ -1061,6 +1061,14 @@ pynumberToCString(PyObject *pyobject, StringInfo buffer,
 	char	   *tempbuffer;
 	Py_ssize_t	strlength = 0;
 
+    if (
+        !PyLong_Check(pyobject) &&
+        (cinfo->atttypoid == INT2OID || cinfo->atttypoid == INT4OID || cinfo->atttypoid == INT8OID)
+    )
+    {
+        pyobject = PyNumber_Long(pyobject);
+    }
+
 	pTempStr = PyObject_Str(pyobject);
 	PyString_AsStringAndSize(pTempStr, &tempbuffer, &strlength);
 	appendBinaryStringInfo(buffer, tempbuffer, strlength);
