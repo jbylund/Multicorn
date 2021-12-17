@@ -1069,8 +1069,7 @@ pynumberToCString(PyObject *pyobject, StringInfo buffer,
         /*
          * Certain data sources, such as ElasticSearch, can return floats for
          * aggregations of integers that are expected to return integers
-         * (e.g. ElasticSearch for min, max, sum), so we basically need to do
-         * int() here.
+         * (e.g. min, max, sum), so we basically need to do int() here.
          */
         pyobject = PyNumber_Long(pyobject);
     }
