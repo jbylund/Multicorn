@@ -595,7 +595,7 @@ multicornGetForeignPlan(PlannerInfo *root,
 							serializePlanState(planstate)
 #if PG_VERSION_NUM >= 90500
 							, fdw_scan_tlist
-							, NIL
+							, NULL /* All quals are meant to be rechecked */
 							, outer_plan
 #endif
 							);
