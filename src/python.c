@@ -1057,7 +1057,7 @@ void
 pynumberToCString(PyObject *pyobject, StringInfo buffer,
 				  ConversionInfo * cinfo)
 {
-	PyObject   *pTempStr;
+	PyObject   *pTempStr, *pyTempLong;
 	char	   *tempbuffer;
 	Py_ssize_t	strlength = 0;
 
@@ -1071,10 +1071,15 @@ pynumberToCString(PyObject *pyobject, StringInfo buffer,
          * aggregations of integers that are expected to return integers
          * (e.g. min, max, sum), so we basically need to do int() here.
          */
-        pyobject = PyNumber_Long(pyobject);
+        pyTempLong = PyNumber_Long(pyobject);
+        pTempStr = PyObject_Str(pyTempLong);
+        Py_DECREF(pyTempLong);
+    }
+    else
+    {
+        pTempStr = PyObject_Str(pyobject);
     }
 
-	pTempStr = PyObject_Str(pyobject);
 	PyString_AsStringAndSize(pTempStr, &tempbuffer, &strlength);
 	appendBinaryStringInfo(buffer, tempbuffer, strlength);
 	Py_DECREF(pTempStr);
