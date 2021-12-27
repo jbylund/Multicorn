@@ -969,6 +969,50 @@ execute(ForeignScanState *node, ExplainState *es)
 		if(PyList_Size(p_pathkeys) > 0){
 			PyDict_SetItemString(kwargs, "sortkeys", p_pathkeys);
 		}
+        if (state->aggs)
+        {
+            PyObject *aggs = PyDict_New();
+            ListCell *lc_agg;
+            List *agg_list;
+
+            foreach(lc_agg, state->aggs)
+            {
+                PyObject    *agg,
+                            *function,
+                            *column;
+
+                agg = PyDict_New();
+
+                agg_list = (List *)lfirst(lc_agg);
+                function = PyUnicode_FromString(strVal(lsecond(agg_list)));
+                column = PyUnicode_FromString(strVal(lthird(agg_list)));
+
+                PyDict_SetItemString(agg, "function", function);
+                PyDict_SetItemString(agg, "column", column);
+                PyDict_SetItemString(aggs, strVal(linitial(agg_list)), agg);
+                Py_DECREF(agg);
+                Py_DECREF(function);
+                Py_DECREF(column);
+            }
+
+            PyDict_SetItemString(kwargs, "aggs", aggs);
+            Py_DECREF(aggs);
+        }
+        if (state->group_clauses)
+        {
+            PyObject *group_clauses = PyList_New(0);
+            ListCell *lc_groupc;
+
+            foreach(lc_groupc, state->group_clauses)
+            {
+                PyObject *column = PyUnicode_FromString(strVal(lfirst(lc_groupc)));
+                PyList_Append(group_clauses, column);
+                Py_DECREF(column);
+            }
+
+            PyDict_SetItemString(kwargs, "group_clauses", group_clauses);
+            Py_DECREF(group_clauses);
+        }
 		if(es != NULL){
 			PyObject * verbose;
 			if(es->verbose){
@@ -1013,11 +1057,29 @@ void
 pynumberToCString(PyObject *pyobject, StringInfo buffer,
 				  ConversionInfo * cinfo)
 {
-	PyObject   *pTempStr;
+	PyObject   *pTempStr, *pyTempLong;
 	char	   *tempbuffer;
 	Py_ssize_t	strlength = 0;
 
-	pTempStr = PyObject_Str(pyobject);
+    if (
+        !PyLong_Check(pyobject) &&
+        (cinfo->atttypoid == INT2OID || cinfo->atttypoid == INT4OID || cinfo->atttypoid == INT8OID)
+    )
+    {
+        /*
+         * Certain data sources, such as ElasticSearch, can return floats for
+         * aggregations of integers that are expected to return integers
+         * (e.g. min, max, sum), so we basically need to do int() here.
+         */
+        pyTempLong = PyNumber_Long(pyobject);
+        pTempStr = PyObject_Str(pyTempLong);
+        Py_DECREF(pyTempLong);
+    }
+    else
+    {
+        pTempStr = PyObject_Str(pyobject);
+    }
+
 	PyString_AsStringAndSize(pTempStr, &tempbuffer, &strlength);
 	appendBinaryStringInfo(buffer, tempbuffer, strlength);
 	Py_DECREF(pTempStr);
@@ -1640,6 +1702,78 @@ canSort(MulticornPlanState * state, List *deparsed)
 	Py_DECREF(p_pathkeys);
 	Py_DECREF(p_sortable);
 	return result;
+}
+
+/*
+ * Call the can_pushdown_upperrel method from the python implementation, to
+ * determine whether upper relations can be pushed down to the corresponding
+ * data source to begin with.
+ *
+ * If yes, then also initialize some fields in MulticornPlanState needed for
+ * more granular conditional logic for assesing whether the particular query
+ * is suitable for pushdown.
+ */
+bool
+canPushdownUpperrel(MulticornPlanState * state)
+{
+    PyObject    *fdw_instance = state->fdw_instance,
+                *p_upperrel_pushdown,
+                *p_object,
+                *p_agg_funcs,
+                *p_agg_func,
+                *p_item;
+    Py_ssize_t	i,
+				size,
+                strlength;
+    char	   *tempbuffer;
+    StringInfo agg_func;
+    bool pushdown_upperrel = false;
+
+    p_upperrel_pushdown = PyObject_CallMethod(fdw_instance, "can_pushdown_upperrel", "()");
+    errorCheck();
+
+    if (p_upperrel_pushdown != NULL && p_upperrel_pushdown != Py_None)
+    {
+        /* Determine whether the FDW instance supports GROUP BYs */
+        p_object = PyMapping_GetItemString(p_upperrel_pushdown, "groupby_supported");
+        if (p_object != NULL && p_object != Py_None)
+		{
+            state->groupby_supported = PyObject_IsTrue(p_object);
+		}
+        Py_XDECREF(p_object);
+
+        /* Determine which aggregation functions are supported */
+        p_object = PyMapping_GetItemString(p_upperrel_pushdown, "agg_functions");
+        if (p_object != NULL && p_object != Py_None)
+		{
+            p_agg_funcs = PyMapping_Keys(p_object);
+            size = PySequence_Size(p_agg_funcs);
+
+            for (i = 0; i < size; i++)
+            {
+                agg_func = makeStringInfo();
+                strlength = 0;
+
+                p_item = PySequence_GetItem(p_agg_funcs, i);
+                p_agg_func = PyUnicode_AsEncodedString(p_item, getPythonEncodingName(), NULL);
+                errorCheck();
+                PyBytes_AsStringAndSize(p_agg_func, &tempbuffer, &strlength);
+                appendBinaryStringInfo(agg_func, tempbuffer, strlength);
+
+                state->agg_functions = lappend(state->agg_functions, makeString(agg_func->data));
+
+                Py_DECREF(p_agg_func);
+                Py_DECREF(p_item);
+            }
+            Py_DECREF(p_agg_funcs);
+		}
+        Py_XDECREF(p_object);
+
+        pushdown_upperrel = true;
+    }
+
+	Py_XDECREF(p_upperrel_pushdown);
+    return pushdown_upperrel;
 }
 
 PyObject *
