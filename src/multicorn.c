@@ -305,12 +305,12 @@ multicornGetForeignRelSize(PlannerInfo *root,
 
 	baserel->fdw_private = planstate;
 
-    // MY CODE START
-    /* Base foreign tables need to be push down always. */
+    /* Base foreign tables need to be push down always */
 	planstate->pushdown_safe = true;
+
+    /* Initialize upperrel pushdown info */
     planstate->groupby_supported = false;
     planstate->agg_functions = NULL;
-    // MY CODE END
 
 	planstate->fdw_instance = getInstance(foreigntableid);
 	planstate->foreigntableid = foreigntableid;
@@ -402,7 +402,6 @@ multicornGetForeignRelSize(PlannerInfo *root,
 
 	}
 
-    // MY CODE START
     /*
 	 * Identify which baserestrictinfo clauses can be sent to the remote
 	 * server and which can't.
@@ -413,7 +412,6 @@ multicornGetForeignRelSize(PlannerInfo *root,
 	 */
 	multicorn_classify_conditions(root, baserel, baserel->baserestrictinfo,
 					              &planstate->remote_conds, &planstate->local_conds);
-    // MY CODE END
 
 	/* Inject the "rows" and "width" attribute into the baserel */
 #if PG_VERSION_NUM >= 90600
@@ -580,13 +578,11 @@ multicornGetForeignPlan(PlannerInfo *root,
 		}
 	}
 
-    // MY CODE START
     /* Extract data needed for aggregations on the Python side */
     if (IS_UPPER_REL(foreignrel))
     {
         multicorn_extract_upper_rel_info(root, fdw_scan_tlist, planstate);
     }
-    // MY CODE END
 
 	return make_foreignscan(tlist,
 							scan_clauses,
@@ -647,9 +643,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	{
 		execstate->rel = node->ss.ss_currentRelation;
 		execstate->tupdesc = RelationGetDescr(execstate->rel);
-        // MY CODE START
         initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), NULL);
-        // MY CODE END
 	}
 	else
 	{
@@ -659,9 +653,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 #else
 		execstate->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 #endif
-        // MY CODE START
         initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), execstate->upper_rel_targets);
-        // MY CODE END
 	}
 
 	execstate->values = palloc(sizeof(Datum) * execstate->tupdesc->natts);
@@ -1602,8 +1594,7 @@ multicorn_merge_fdw_options(MulticornPlanState *fpinfo,
 	fpinfo->use_remote_estimate = fpinfo_o->use_remote_estimate;
 	fpinfo->fetch_size = fpinfo_o->fetch_size;
 
-    // MY CODE START
-    /* Multicorn specific options */
+    /* Multicorn specific options, differing from othe FDW implementations */
     fpinfo->fdw_instance = fpinfo_o->fdw_instance;
     fpinfo->foreigntableid = fpinfo_o->foreigntableid;
 	fpinfo->numattrs = fpinfo_o->numattrs;
@@ -1612,7 +1603,6 @@ multicorn_merge_fdw_options(MulticornPlanState *fpinfo,
     fpinfo->target_list = fpinfo_o->target_list;
     fpinfo->qual_list = fpinfo_o->qual_list;
     fpinfo->pathkeys = fpinfo_o->pathkeys;
-    // MY CODE END
 
 	/* Merge the table level options from either side of the join. */
 	if (fpinfo_i)
@@ -1791,7 +1781,6 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 		i++;
 	}
 
-    // MY CODE START
 	/*
      * TODO: Enable HAVING clause pushdowns.
      * Note that certain simple HAVING clauses get transformed to WHERE clauses
@@ -1804,7 +1793,6 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	{
 		return false;
 	}
-    // MY CODE END
 
 	/* Store generated targetlist */
 	fpinfo->grouped_tlist = tlist;
@@ -1862,13 +1850,17 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 	if (stage != UPPERREL_GROUP_AGG || output_rel->fdw_private)
 		return;
 
-    // MY CODE START
-    /* Check with the Python FDW instance whether it supports pushdown at all */
+    /*
+     * Check with the Python FDW instance whether it supports pushdown at all
+     * NB: Here we deviate from other FDWs, in that we don't know whether the
+     * something can be pushed down without consulting the corresponding Python
+     * FDW instance.
+     */
+
     if (!canPushdownUpperrel((MulticornPlanState *) input_rel->fdw_private))
     {
         return;
     }
-    // MY CODE END
 
 	fpinfo = (MulticornPlanState *) palloc0(sizeof(MulticornPlanState));
 	fpinfo->pushdown_safe = false;
@@ -1926,10 +1918,11 @@ multicorn_add_foreign_grouping_paths(PlannerInfo *root, RelOptInfo *input_rel,
     fpinfo->table = ifpinfo->table;
 	fpinfo->server = ifpinfo->server;
 	fpinfo->user = ifpinfo->user;
-    // MY CODE START
+
+    /* copy the upperrel pushdown info as well */
     fpinfo->groupby_supported = ifpinfo->groupby_supported;
 	fpinfo->agg_functions = ifpinfo->agg_functions;
-    // MY CODE END
+
     multicorn_merge_fdw_options(fpinfo, ifpinfo, NULL);
 
     /*
