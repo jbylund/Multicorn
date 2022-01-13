@@ -122,10 +122,10 @@ initConversioninfo(ConversionInfo ** cinfos, AttInMetadata *attinmeta, List *upp
         if (upper_rel_targets)
         {
             /*
-            * For aggregations/groupings the targets lack attname, so we instead
-            * refer to the targets through references generated in
-            * multicorn_extract_upper_rel_info().
-            */
+             * For aggregations/groupings the targets lack attname, so we instead
+             * refer to the targets through references generated in
+             * multicorn_extract_upper_rel_info().
+             */
             attrname = strVal(list_nth(upper_rel_targets, i));
         }
 

@@ -170,6 +170,12 @@ typedef struct MulticornExecState
 	bool	   *nulls;
 	ConversionInfo **cinfos;
     /*
+     * In case of aggregations the upper rel target list does not correspond to
+     * the base table target list, so separate conversion information must be
+     * provided when converting the quals in the execute method.
+     */
+    ConversionInfo **qual_cinfos;
+    /*
      * List containing targets to be returned from Python in case of aggregations.
      * List elements are aggregation keys or group_clauses elements.
      */
@@ -187,6 +193,11 @@ typedef struct MulticornExecState
      * List elements are column names for grouping.
      */
 	List *group_clauses;
+    /*
+     * Remote conditions parsed in the MulticornGetForeignRelSize
+     */
+    List *remote_conds;
+
 	/* Common buffer to avoid repeated allocations */
 	StringInfo	buffer;
 	AttrNumber	rowidAttno;

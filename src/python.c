@@ -944,7 +944,7 @@ execute(ForeignScanState *node, ExplainState *es)
 		}
 		if (newqual != NULL)
 		{
-			PyObject   *python_qual = qualdefToPython((MulticornConstQual *) newqual, state->cinfos);
+			PyObject   *python_qual = qualdefToPython((MulticornConstQual *) newqual, state->qual_cinfos);
 
 			if (python_qual != NULL)
 			{
