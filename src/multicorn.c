@@ -402,16 +402,7 @@ multicornGetForeignRelSize(PlannerInfo *root,
 
 	}
 
-    /*
-	 * Identify which baserestrictinfo clauses can be sent to the remote
-	 * server and which can't.
-     * TODO: for now all WHERE clauses will be classified as local conditions
-     * since multicorn_foreign_expr_walker lacks T_OpExpr and T_Const cases,
-     * thus preventing pushdown. When adding support for this make sure to align
-     * the code in multicorn_extract_upper_rel_info as well.
-	 */
-	multicorn_classify_conditions(root, baserel, baserel->baserestrictinfo,
-					              &planstate->remote_conds, &planstate->local_conds);
+    planstate->baserestrictinfo = baserel->baserestrictinfo;
 
 	/* Inject the "rows" and "width" attribute into the baserel */
 #if PG_VERSION_NUM >= 90600
@@ -594,13 +585,11 @@ multicornGetForeignPlan(PlannerInfo *root,
         multicorn_extract_upper_rel_info(root, fdw_scan_tlist, planstate);
 
         /*
-         * We have already identified remote conditions in MulticornGetForeignRelSize
-         * via multicorn_classify_conditions and need to use those, since scan_clauses
-         * are empty for upper relations for some reason. We pass the extracted clauses
-         * to the scan phase via serializePlanState.
+         * Since scan_clauses are empty in case of upper relations for some
+         * reason. We pass the clauses from the base relation obtained in MulticornGetForeignRelSize.
          */
         ofpinfo = (MulticornPlanState *) planstate->outerrel->fdw_private;
-        planstate->remote_conds = extract_actual_clauses(ofpinfo->remote_conds, false);
+        planstate->baserestrictinfo = extract_actual_clauses(ofpinfo->baserestrictinfo, false);
     }
 
 	return make_foreignscan(tlist,
@@ -694,7 +683,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
          * NB: This may not work well in case of joins, keep an eye out for it.
          */
         rtindex = bms_next_member(fscan->fs_relids, -1);
-        clauses = execstate->remote_conds;
+        clauses = execstate->baserestrictinfo;
 	}
 
 	execstate->values = palloc(sizeof(Datum) * execstate->tupdesc->natts);
@@ -2021,7 +2010,7 @@ serializePlanState(MulticornPlanState * state)
 
     result = lappend(result, state->group_clauses);
 
-    result = lappend(result, state->remote_conds);
+    result = lappend(result, state->baserestrictinfo);
 
 	return result;
 }
@@ -2064,6 +2053,6 @@ initializeExecState(void *internalstate)
     execstate->upper_rel_targets = list_nth(values, 4);
     execstate->aggs = list_nth(values, 5);
     execstate->group_clauses = list_nth(values, 6);
-    execstate->remote_conds = list_nth(values, 7);
+    execstate->baserestrictinfo = list_nth(values, 7);
 	return execstate;
 }
