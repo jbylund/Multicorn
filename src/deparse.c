@@ -195,6 +195,7 @@ multicorn_foreign_expr_walker(Node *node,
 				Aggref	   *agg = (Aggref *) node;
 				ListCell   *lc;
 				char	   *opername = NULL;
+                StringInfo opername_composite = makeStringInfo();
 				Oid			schema;
 
 				/* get function name and schema */
@@ -211,11 +212,20 @@ multicorn_foreign_expr_walker(Node *node,
 				if (schema != PG_CATALOG_NAMESPACE)
 					return false;
 
-				/* Make sure the specific function at hand is shippable
+                /* Make sure the specific function at hand is shippable
                  * NB: here we deviate from standard FDW code, since the allowed
                  * function list is fetched from the Python FDW instance
                  */
-				if (!list_member(fpinfo->agg_functions, makeString(opername)))
+                if (agg->aggstar)
+                {
+                    initStringInfo(opername_composite);
+                    appendStringInfoString(opername_composite, opername);
+                    appendStringInfoString(opername_composite, ".*");
+
+                    if (!list_member(fpinfo->agg_functions, makeString(opername_composite->data)))
+					    return false;
+                }
+				else if (!list_member(fpinfo->agg_functions, makeString(opername)))
 					return false;
 
 				/* Not safe to pushdown when not in grouping context */
@@ -227,10 +237,10 @@ multicorn_foreign_expr_walker(Node *node,
 					return false;
 
                 /*
-                 * For now we don't push down DISTINCT or COUNT(*) aggregations.
+                 * For now we don't push down DISTINCT aggregations.
                  * TODO: Enable this
                  */
-                if (agg->aggdistinct || agg->aggstar)
+                if (agg->aggdistinct)
                     return false;
 
 				/*
@@ -536,10 +546,17 @@ multicorn_extract_upper_rel_info(PlannerInfo *root, List *tlist, MulticornPlanSt
             aggref = (Aggref *) tle->expr;
             function = multicorn_deparse_function_name(aggref->aggfnoid);
 
-            var = linitial(pull_var_clause((Node *) aggref,
+            if (aggref->aggstar)
+            {
+                colname = makeString("*");
+            }
+            else
+            {
+                var = linitial(pull_var_clause((Node *) aggref,
                                             PVC_RECURSE_AGGREGATES |
                                             PVC_RECURSE_PLACEHOLDERS));
-            colname = colnameFromVar(var, root);
+                colname = colnameFromVar(var, root);
+            }
 
             initStringInfo(agg_key);
             appendStringInfoString(agg_key, strVal(function));
