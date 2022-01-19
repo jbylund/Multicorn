@@ -308,12 +308,12 @@ multicornGetForeignRelSize(PlannerInfo *root,
     /* Base foreign tables need to be push down always */
 	planstate->pushdown_safe = true;
 
-    /* Initialize upperrel pushdown info */
-    planstate->groupby_supported = false;
-    planstate->agg_functions = NULL;
-
 	planstate->fdw_instance = getInstance(foreigntableid);
 	planstate->foreigntableid = foreigntableid;
+
+    /* Initialize upperrel pushdown info */
+    initUpperrelPushdownInfo(planstate);
+    
 	/* Initialize the conversion info array */
 	{
 		Relation	rel = RelationIdGetRelation(ftable->relid);
@@ -402,7 +402,12 @@ multicornGetForeignRelSize(PlannerInfo *root,
 
 	}
 
-    planstate->baserestrictinfo = baserel->baserestrictinfo;
+    /*
+	 * Identify which baserestrictinfo clauses can be sent to the remote server
+     * and which can't.
+	 */
+	multicorn_classify_conditions(root, baserel, baserel->baserestrictinfo,
+					              &planstate->remote_conds, &planstate->local_conds);
 
 	/* Inject the "rows" and "width" attribute into the baserel */
 #if PG_VERSION_NUM >= 90600
@@ -589,7 +594,7 @@ multicornGetForeignPlan(PlannerInfo *root,
          * reason. We pass the clauses from the base relation obtained in MulticornGetForeignRelSize.
          */
         ofpinfo = (MulticornPlanState *) planstate->outerrel->fdw_private;
-        planstate->baserestrictinfo = extract_actual_clauses(ofpinfo->baserestrictinfo, false);
+        planstate->remote_conds = extract_actual_clauses(ofpinfo->remote_conds, false);
     }
 
 	return make_foreignscan(tlist,
@@ -683,7 +688,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
          * NB: This may not work well in case of joins, keep an eye out for it.
          */
         rtindex = bms_next_member(fscan->fs_relids, -1);
-        clauses = execstate->baserestrictinfo;
+        clauses = execstate->remote_conds;
 	}
 
 	execstate->values = palloc(sizeof(Datum) * execstate->tupdesc->natts);
@@ -1882,12 +1887,12 @@ multicornGetForeignUpperPaths(PlannerInfo *root, UpperRelationKind stage,
 
     /*
      * Check with the Python FDW instance whether it supports pushdown at all
-     * NB: Here we deviate from other FDWs, in that we don't know whether the
+     * NB: Here we deviate from other FDWs, in that we don't know whether
      * something can be pushed down without consulting the corresponding Python
      * FDW instance.
      */
 
-    if (!canPushdownUpperrel((MulticornPlanState *) input_rel->fdw_private))
+    if (!((MulticornPlanState *) input_rel->fdw_private)->upperrel_pushdown_supported)
     {
         return;
     }
@@ -2010,7 +2015,7 @@ serializePlanState(MulticornPlanState * state)
 
     result = lappend(result, state->group_clauses);
 
-    result = lappend(result, state->baserestrictinfo);
+    result = lappend(result, state->remote_conds);
 
 	return result;
 }
@@ -2053,6 +2058,6 @@ initializeExecState(void *internalstate)
     execstate->upper_rel_targets = list_nth(values, 4);
     execstate->aggs = list_nth(values, 5);
     execstate->group_clauses = list_nth(values, 6);
-    execstate->baserestrictinfo = list_nth(values, 7);
+    execstate->remote_conds = list_nth(values, 7);
 	return execstate;
 }

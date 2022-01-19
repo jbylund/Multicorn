@@ -228,12 +228,17 @@ class ForeignDataWrapper(object):
                     <PG_agg_func_name>: <foreign_agg_func_name>,
                     ...
                 },
+                "supported_operators": [">", "<", "=", ...]
             }
 
             Each entry in `agg_functions` dict corresponds to a maping between
             the name of a aggregation function in PostgreSQL, and the equivalent
             foreign function. If no mapping exists for an aggregate function any
             queries containing it won't be pushed down.
+
+            The `supported_operators` entry lists all operators that can be used
+            in qual (WHERE) clauses so that the aggregation pushdown will still
+            be supported.
         """
         return None
 

@@ -101,8 +101,10 @@ typedef struct MulticornPlanState
 	int width;
 
     /* Details about upperrel pushdown fetched from the Python FDW instance */
+    bool upperrel_pushdown_supported;
     bool groupby_supported;
     List *agg_functions;
+    List *operators_supported;
 
     /*
      * Aggregation and grouping data to be passed to the execution phase.
@@ -118,9 +120,9 @@ typedef struct MulticornPlanState
 	 */
 	bool		pushdown_safe;
 
-	/* qual clauses */
-	List	   *baserestrictinfo;
-    List       *local_conds;
+	/* baserestrictinfo clauses, broken down into safe and unsafe subsets. */
+	List	   *remote_conds;
+	List	   *local_conds;
 
     /* Actual remote restriction clauses for scan (sans RestrictInfos) */
 	List	   *final_remote_exprs;
@@ -194,9 +196,9 @@ typedef struct MulticornExecState
      */
 	List *group_clauses;
     /*
-     * Qual conditions parsed in the MulticornGetForeignRelSize
+     * Remote conditions parsed in the MulticornGetForeignRelSize
      */
-    List *baserestrictinfo;
+    List *remote_conds;
 
 	/* Common buffer to avoid repeated allocations */
 	StringInfo	buffer;
@@ -270,6 +272,11 @@ typedef struct MulticornDeparsedSortGroup
 } MulticornDeparsedSortGroup;
 
 /* deparse.c */
+extern void multicorn_classify_conditions(PlannerInfo *root,
+                                RelOptInfo *baserel,
+                                List *input_conds,
+                                List **remote_conds,
+                                List **local_conds);
 extern bool multicorn_is_foreign_expr(PlannerInfo *root,
 								      RelOptInfo *baserel,
 								      Expr *expr);
@@ -298,7 +305,7 @@ PyObject   *tupleTableSlotToPyObject(TupleTableSlot *slot, ConversionInfo ** cin
 char	   *getRowIdColumn(PyObject *fdw_instance);
 PyObject   *optionsListToPyDict(List *options);
 const char *getPythonEncodingName(void);
-bool canPushdownUpperrel(MulticornPlanState * state);
+void initUpperrelPushdownInfo(MulticornPlanState * state);
 
 void getRelSize(MulticornPlanState * state,
 		PlannerInfo *root,
