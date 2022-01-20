@@ -1684,12 +1684,16 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	ofpinfo = (MulticornPlanState *) fpinfo->outerrel->fdw_private;
 
 	/*
-	 * If underlying scan relation has any local conditions, those conditions
-	 * are required to be applied before performing aggregation.  Hence the
-	 * aggregate cannot be pushed down.
+	 * If underlying scan relation has any quals with unsupported operators
+     * we cannot pushdown the aggregation.
 	 */
-	if (ofpinfo->local_conds)
-		return false;
+    foreach(lc, ofpinfo->qual_list)
+    {
+        MulticornBaseQual *qual = (MulticornBaseQual *) lfirst(lc);
+
+        if (!list_member(ofpinfo->operators_supported, makeString(qual->opname)))
+            return false;
+    }
 
     /*
 	 * Examine grouping expressions, as well as other expressions we'd need to

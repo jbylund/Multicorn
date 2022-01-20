@@ -103,6 +103,7 @@ typedef struct MulticornPlanState
     /* Details about upperrel pushdown fetched from the Python FDW instance */
     bool groupby_supported;
     List *agg_functions;
+    List *operators_supported;
 
     /*
      * Aggregation and grouping data to be passed to the execution phase.
@@ -120,7 +121,6 @@ typedef struct MulticornPlanState
 
 	/* qual clauses */
 	List	   *baserestrictinfo;
-    List       *local_conds;
 
     /* Actual remote restriction clauses for scan (sans RestrictInfos) */
 	List	   *final_remote_exprs;

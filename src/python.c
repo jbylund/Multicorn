@@ -1721,12 +1721,13 @@ canPushdownUpperrel(MulticornPlanState * state)
                 *p_object,
                 *p_agg_funcs,
                 *p_agg_func,
+                *p_ops,
                 *p_item;
     Py_ssize_t	i,
 				size,
                 strlength;
     char	   *tempbuffer;
-    StringInfo agg_func;
+    StringInfo agg_func, operator;
     bool pushdown_upperrel = false;
 
     p_upperrel_pushdown = PyObject_CallMethod(fdw_instance, "can_pushdown_upperrel", "()");
@@ -1768,6 +1769,31 @@ canPushdownUpperrel(MulticornPlanState * state)
             Py_DECREF(p_agg_funcs);
 		}
         Py_XDECREF(p_object);
+
+        /* Construct supported qual operators list */
+        p_ops = PyMapping_GetItemString(p_upperrel_pushdown, "operators_supported");
+        if (p_ops != NULL && p_ops != Py_None)
+		{
+            size = PySequence_Size(p_ops);
+
+            for (i = 0; i < size; i++)
+            {
+                operator = makeStringInfo();
+                strlength = 0;
+
+                p_item = PySequence_GetItem(p_ops, i);
+                p_object = PyUnicode_AsEncodedString(p_item, getPythonEncodingName(), NULL);
+                errorCheck();
+                PyBytes_AsStringAndSize(p_object, &tempbuffer, &strlength);
+                appendBinaryStringInfo(operator, tempbuffer, strlength);
+
+                state->operators_supported = lappend(state->operators_supported, makeString(operator->data));
+
+                Py_DECREF(p_object);
+                Py_DECREF(p_item);
+            }
+		}
+        Py_XDECREF(p_ops);
 
         pushdown_upperrel = true;
     }

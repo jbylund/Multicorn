@@ -487,22 +487,6 @@ multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel)
 	if (IS_UPPER_REL(foreignrel))
 		return fpinfo->grouped_tlist;
 
-	/*
-	 * We require columns specified in foreignrel->reltarget->exprs and those
-	 * required for evaluating the local conditions.
-	 */
-	tlist = add_to_flat_tlist(tlist,
-							  pull_var_clause((Node *) foreignrel->reltarget->exprs,
-											  PVC_RECURSE_PLACEHOLDERS));
-	foreach(lc, fpinfo->local_conds)
-	{
-		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-
-		tlist = add_to_flat_tlist(tlist,
-								  pull_var_clause((Node *) rinfo->clause,
-												  PVC_RECURSE_PLACEHOLDERS));
-	}
-
 	return tlist;
 }
 
