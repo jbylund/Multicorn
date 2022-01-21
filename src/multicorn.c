@@ -402,16 +402,7 @@ multicornGetForeignRelSize(PlannerInfo *root,
 
 	}
 
-    /*
-	 * Identify which baserestrictinfo clauses can be sent to the remote
-	 * server and which can't.
-     * TODO: for now all WHERE clauses will be classified as local conditions
-     * since multicorn_foreign_expr_walker lacks T_OpExpr and T_Const cases,
-     * thus preventing pushdown. When adding support for this make sure to align
-     * the code in multicorn_extract_upper_rel_info as well.
-	 */
-	multicorn_classify_conditions(root, baserel, baserel->baserestrictinfo,
-					              &planstate->remote_conds, &planstate->local_conds);
+    planstate->baserestrictinfo = baserel->baserestrictinfo;
 
 	/* Inject the "rows" and "width" attribute into the baserel */
 #if PG_VERSION_NUM >= 90600
@@ -529,7 +520,7 @@ multicornGetForeignPlan(PlannerInfo *root,
 #endif
 		)
 {
-    MulticornPlanState *planstate = (MulticornPlanState *) foreignrel->fdw_private;
+    MulticornPlanState *ofpinfo, *planstate = (MulticornPlanState *) foreignrel->fdw_private;
     Index		scan_relid;
 	List	   *fdw_scan_tlist = NIL;
     ListCell   *lc;
@@ -581,7 +572,24 @@ multicornGetForeignPlan(PlannerInfo *root,
     /* Extract data needed for aggregations on the Python side */
     if (IS_UPPER_REL(foreignrel))
     {
+        /*
+         * TODO: fdw_scan_tlist is present in the execute phase as well, via
+         * node->ss.ps.plan.fdw_scan_tlist, and instead of root, one can employ
+         * rte = exec_rt_fetch(rtindex, estate) to fetch the column name through
+         * get_attname.
+         *
+         * Migrating the below function into multicornBeginForeignScan would thus
+         * reduce the duplication of plan and execute fields that are now being
+         * serialized.
+         */
         multicorn_extract_upper_rel_info(root, fdw_scan_tlist, planstate);
+
+        /*
+         * Since scan_clauses are empty in case of upper relations for some
+         * reason. We pass the clauses from the base relation obtained in MulticornGetForeignRelSize.
+         */
+        ofpinfo = (MulticornPlanState *) planstate->outerrel->fdw_private;
+        planstate->baserestrictinfo = extract_actual_clauses(ofpinfo->baserestrictinfo, false);
     }
 
 	return make_foreignscan(tlist,
@@ -632,6 +640,8 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
 	MulticornExecState *execstate;
 	ListCell   *lc;
+    int			rtindex;
+    List *clauses;
 
     execstate = initializeExecState(fscan->fdw_private);
 
@@ -641,12 +651,24 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	 */
 	if (fscan->scan.scanrelid > 0)
 	{
+        /*
+         * Simple/base relation
+         */
+
 		execstate->rel = node->ss.ss_currentRelation;
 		execstate->tupdesc = RelationGetDescr(execstate->rel);
         initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), NULL);
+
+        // Needed for parsing quals
+        rtindex = fscan->scan.scanrelid;
+        clauses = fscan->fdw_exprs;
 	}
 	else
 	{
+        /*
+         * Upper (aggregation) relation
+         */
+
 		execstate->rel = NULL;
 #if (PG_VERSION_NUM >= 140000)
 		execstate->tupdesc = multicorn_get_tupdesc_for_join_scan_tuples(node);
@@ -654,17 +676,25 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 		execstate->tupdesc = node->ss.ss_ScanTupleSlot->tts_tupleDescriptor;
 #endif
         initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), execstate->upper_rel_targets);
+
+        /*
+         * In case of a join or aggregate use the lowest-numbered member RTE out
+         * of all all the base relations participating in the underlying scan.
+         * NB: This may not work well in case of joins, keep an eye out for it.
+         */
+        rtindex = bms_next_member(fscan->fs_relids, -1);
+        clauses = execstate->baserestrictinfo;
 	}
 
 	execstate->values = palloc(sizeof(Datum) * execstate->tupdesc->natts);
 	execstate->nulls = palloc(sizeof(bool) * execstate->tupdesc->natts);
-	execstate->qual_list = NULL;
-	foreach(lc, fscan->fdw_exprs)
-	{
-		extractRestrictions(bms_make_singleton(fscan->scan.scanrelid),
-							((Expr *) lfirst(lc)),
-							&execstate->qual_list);
-	}
+    execstate->qual_list = NULL;
+    foreach(lc, clauses)
+    {
+        extractRestrictions(bms_make_singleton(rtindex),
+                            ((Expr *) lfirst(lc)),
+                            &execstate->qual_list);
+    }
 
 	execstate->subscanCxt = AllocSetContextCreate(
 		node->ss.ps.state->es_query_cxt,
@@ -1654,12 +1684,16 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	ofpinfo = (MulticornPlanState *) fpinfo->outerrel->fdw_private;
 
 	/*
-	 * If underlying scan relation has any local conditions, those conditions
-	 * are required to be applied before performing aggregation.  Hence the
-	 * aggregate cannot be pushed down.
+	 * If underlying scan relation has any quals with unsupported operators
+     * we cannot pushdown the aggregation.
 	 */
-	if (ofpinfo->local_conds)
-		return false;
+    foreach(lc, ofpinfo->qual_list)
+    {
+        MulticornBaseQual *qual = (MulticornBaseQual *) lfirst(lc);
+
+        if (!list_member(ofpinfo->operators_supported, makeString(qual->opname)))
+            return false;
+    }
 
     /*
 	 * Examine grouping expressions, as well as other expressions we'd need to
@@ -1980,6 +2014,8 @@ serializePlanState(MulticornPlanState * state)
 
     result = lappend(result, state->group_clauses);
 
+    result = lappend(result, state->baserestrictinfo);
+
 	return result;
 }
 
@@ -1996,6 +2032,16 @@ initializeExecState(void *internalstate)
 	Oid			foreigntableid = ((Const *) lsecond(values))->constvalue;
 	List		*pathkeys;
 
+    ForeignTable *ftable = GetForeignTable(foreigntableid);
+    Relation	rel = RelationIdGetRelation(ftable->relid);
+    AttInMetadata *attinmeta;
+
+    attinmeta = TupleDescGetAttInMetadata(rel->rd_att);
+    execstate->qual_cinfos = palloc0(sizeof(ConversionInfo *) *
+                                     attinmeta->tupdesc->natts);
+    initConversioninfo(execstate->qual_cinfos, attinmeta, NULL);
+    RelationClose(rel);
+
 	/* Those list must be copied, because their memory context can become */
 	/* invalid during the execution (in particular with the cursor interface) */
 	execstate->target_list = copyObject(lthird(values));
@@ -2011,5 +2057,6 @@ initializeExecState(void *internalstate)
     execstate->upper_rel_targets = list_nth(values, 4);
     execstate->aggs = list_nth(values, 5);
     execstate->group_clauses = list_nth(values, 6);
+    execstate->baserestrictinfo = list_nth(values, 7);
 	return execstate;
 }

@@ -944,7 +944,7 @@ execute(ForeignScanState *node, ExplainState *es)
 		}
 		if (newqual != NULL)
 		{
-			PyObject   *python_qual = qualdefToPython((MulticornConstQual *) newqual, state->cinfos);
+			PyObject   *python_qual = qualdefToPython((MulticornConstQual *) newqual, state->qual_cinfos);
 
 			if (python_qual != NULL)
 			{
@@ -1408,6 +1408,40 @@ pyobjectToDatum(PyObject *object, StringInfo buffer,
 	return value;
 }
 
+void
+pythonUnicodeSequenceToList(PyObject *pySequence, List **target)
+{
+    PyObject    *p_item,
+                *p_string;
+    Py_ssize_t	i,
+				size,
+                strlength;
+    char	   *tempbuffer;
+    StringInfo element;
+
+    if (pySequence != NULL && pySequence != Py_None)
+    {
+        size = PySequence_Size(pySequence);
+
+        for (i = 0; i < size; i++)
+        {
+            element = makeStringInfo();
+            strlength = 0;
+
+            p_item = PySequence_GetItem(pySequence, i);
+            p_string = PyUnicode_AsEncodedString(p_item, getPythonEncodingName(), NULL);
+            errorCheck();
+            PyBytes_AsStringAndSize(p_string, &tempbuffer, &strlength);
+            appendBinaryStringInfo(element, tempbuffer, strlength);
+
+            *target = lappend(*target, makeString(element->data));
+
+            Py_DECREF(p_item);
+            Py_DECREF(p_string);
+        }
+    }
+}
+
 PyObject *
 datumStringToPython(Datum datum, ConversionInfo * cinfo)
 {
@@ -1720,13 +1754,7 @@ canPushdownUpperrel(MulticornPlanState * state)
                 *p_upperrel_pushdown,
                 *p_object,
                 *p_agg_funcs,
-                *p_agg_func,
-                *p_item;
-    Py_ssize_t	i,
-				size,
-                strlength;
-    char	   *tempbuffer;
-    StringInfo agg_func;
+                *p_ops;
     bool pushdown_upperrel = false;
 
     p_upperrel_pushdown = PyObject_CallMethod(fdw_instance, "can_pushdown_upperrel", "()");
@@ -1747,27 +1775,15 @@ canPushdownUpperrel(MulticornPlanState * state)
         if (p_object != NULL && p_object != Py_None)
 		{
             p_agg_funcs = PyMapping_Keys(p_object);
-            size = PySequence_Size(p_agg_funcs);
-
-            for (i = 0; i < size; i++)
-            {
-                agg_func = makeStringInfo();
-                strlength = 0;
-
-                p_item = PySequence_GetItem(p_agg_funcs, i);
-                p_agg_func = PyUnicode_AsEncodedString(p_item, getPythonEncodingName(), NULL);
-                errorCheck();
-                PyBytes_AsStringAndSize(p_agg_func, &tempbuffer, &strlength);
-                appendBinaryStringInfo(agg_func, tempbuffer, strlength);
-
-                state->agg_functions = lappend(state->agg_functions, makeString(agg_func->data));
-
-                Py_DECREF(p_agg_func);
-                Py_DECREF(p_item);
-            }
+            pythonUnicodeSequenceToList(p_agg_funcs, &state->agg_functions);
             Py_DECREF(p_agg_funcs);
 		}
         Py_XDECREF(p_object);
+
+        /* Construct supported qual operators list */
+        p_ops = PyMapping_GetItemString(p_upperrel_pushdown, "operators_supported");
+        pythonUnicodeSequenceToList(p_ops, &state->operators_supported);
+        Py_XDECREF(p_ops);
 
         pushdown_upperrel = true;
     }

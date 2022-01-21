@@ -76,34 +76,6 @@ typedef struct foreign_loc_cxt
 
 static Value *multicorn_deparse_function_name(Oid funcid);
 
-/*
- * Examine each qual clause in input_conds, and classify them into two groups,
- * which are returned as two lists:
- *	- remote_conds contains expressions that can be evaluated remotely
- *	- local_conds contains expressions that can't be evaluated remotely
- */
-void
-multicorn_classify_conditions(PlannerInfo *root,
-                    RelOptInfo *baserel,
-                    List *input_conds,
-                    List **remote_conds,
-                    List **local_conds)
-{
-	ListCell   *lc;
-
-	*remote_conds = NIL;
-	*local_conds = NIL;
-
-	foreach(lc, input_conds)
-	{
-		RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
-
-		if (multicorn_is_foreign_expr(root, baserel, ri->clause))
-			*remote_conds = lappend(*remote_conds, ri);
-		else
-			*local_conds = lappend(*local_conds, ri);
-	}
-}
 
 /*
  * Return true if given object is one of PostgreSQL's built-in objects.
@@ -223,6 +195,7 @@ multicorn_foreign_expr_walker(Node *node,
 				Aggref	   *agg = (Aggref *) node;
 				ListCell   *lc;
 				char	   *opername = NULL;
+                StringInfo opername_composite = makeStringInfo();
 				Oid			schema;
 
 				/* get function name and schema */
@@ -239,11 +212,20 @@ multicorn_foreign_expr_walker(Node *node,
 				if (schema != PG_CATALOG_NAMESPACE)
 					return false;
 
-				/* Make sure the specific function at hand is shippable
+                /* Make sure the specific function at hand is shippable
                  * NB: here we deviate from standard FDW code, since the allowed
                  * function list is fetched from the Python FDW instance
                  */
-				if (!list_member(fpinfo->agg_functions, makeString(opername)))
+                if (agg->aggstar)
+                {
+                    initStringInfo(opername_composite);
+                    appendStringInfoString(opername_composite, opername);
+                    appendStringInfoString(opername_composite, ".*");
+
+                    if (!list_member(fpinfo->agg_functions, makeString(opername_composite->data)))
+					    return false;
+                }
+				else if (!list_member(fpinfo->agg_functions, makeString(opername)))
 					return false;
 
 				/* Not safe to pushdown when not in grouping context */
@@ -255,10 +237,10 @@ multicorn_foreign_expr_walker(Node *node,
 					return false;
 
                 /*
-                 * For now we don't push down DISTINCT or COUNT(*) aggregations.
+                 * For now we don't push down DISTINCT aggregations.
                  * TODO: Enable this
                  */
-                if (agg->aggdistinct || agg->aggstar)
+                if (agg->aggdistinct)
                     return false;
 
 				/*
@@ -505,22 +487,6 @@ multicorn_build_tlist_to_deparse(RelOptInfo *foreignrel)
 	if (IS_UPPER_REL(foreignrel))
 		return fpinfo->grouped_tlist;
 
-	/*
-	 * We require columns specified in foreignrel->reltarget->exprs and those
-	 * required for evaluating the local conditions.
-	 */
-	tlist = add_to_flat_tlist(tlist,
-							  pull_var_clause((Node *) foreignrel->reltarget->exprs,
-											  PVC_RECURSE_PLACEHOLDERS));
-	foreach(lc, fpinfo->local_conds)
-	{
-		RestrictInfo *rinfo = lfirst_node(RestrictInfo, lc);
-
-		tlist = add_to_flat_tlist(tlist,
-								  pull_var_clause((Node *) rinfo->clause,
-												  PVC_RECURSE_PLACEHOLDERS));
-	}
-
 	return tlist;
 }
 
@@ -564,10 +530,17 @@ multicorn_extract_upper_rel_info(PlannerInfo *root, List *tlist, MulticornPlanSt
             aggref = (Aggref *) tle->expr;
             function = multicorn_deparse_function_name(aggref->aggfnoid);
 
-            var = linitial(pull_var_clause((Node *) aggref,
+            if (aggref->aggstar)
+            {
+                colname = makeString("*");
+            }
+            else
+            {
+                var = linitial(pull_var_clause((Node *) aggref,
                                             PVC_RECURSE_AGGREGATES |
                                             PVC_RECURSE_PLACEHOLDERS));
-            colname = colnameFromVar(var, root);
+                colname = colnameFromVar(var, root);
+            }
 
             initStringInfo(agg_key);
             appendStringInfoString(agg_key, strVal(function));
