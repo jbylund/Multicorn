@@ -412,7 +412,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
     def can_pushdown_upperrel(self):
         return {
             "groupby_supported": True,
-            "agg_functions": _PG_AGG_FUNC_MAPPING.keys(),
+            "agg_functions": list(_PG_AGG_FUNC_MAPPING),
             "operators_supported": [op for op in OPERATORS if isinstance(op, str)],
         }
 
