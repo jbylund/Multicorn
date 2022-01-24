@@ -159,7 +159,7 @@ from typing import Optional
 from sqlalchemy import create_engine
 from sqlalchemy.engine.url import make_url, URL
 from sqlalchemy.exc import UnsupportedCompilationError
-from sqlalchemy.sql import select, operators as sqlops, and_
+from sqlalchemy.sql import select, operators as sqlops, func, and_
 from sqlalchemy.sql.expression import nullsfirst, nullslast, text
 
 from . import ForeignDataWrapper, TableDefinition, ColumnDefinition
@@ -224,6 +224,14 @@ def _parse_url_from_options(fdw_options):
         if param in fdw_options:
             setattr(url, param, fdw_options[param])
     return url
+
+_PG_AGG_FUNC_MAPPING = {
+    "min": func.min,
+    "max": func.max,
+    "sum", func.sum,
+    "count": func.count,
+    "count.*": func.count
+}
 
 
 OPERATORS = {
@@ -401,13 +409,35 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             return []
         return sortkeys
 
-    def explain(self, quals, columns, sortkeys=None, verbose=False):
+    def can_pushdown_upperrel(self):
+        return {
+            "groupby_supported": True,
+            "agg_functions": _PG_AGG_FUNC_MAPPING.keys(),
+            "operators_supported": [op for op in OPERATORS if isinstance(op, str)],
+        }
+
+    def explain(self, quals, columns, sortkeys=None, aggs=None, group_clauses=None, verbose=False):
         sortkeys = sortkeys or []
-        statement = self._build_statement(quals, columns, sortkeys)
+        statement = self._build_statement(quals, columns, sortkeys, aggs=aggs, group_clauses=group_clauses)
         return [str(statement)]
 
-    def _build_statement(self, quals, columns, sortkeys):
-        statement = select([self.table])
+    def _build_statement(self, quals, columns, sortkeys, aggs=None, group_clauses=None):
+        is_aggregation = aggs or group_clauses
+
+        if not is_aggregation:
+            statement = select([self.table])
+        else:
+            target_list = [self.table.c[col] for col in group_clauses]
+
+            for agg_name, agg_props in aggs.items():
+                agg_func = _PG_AGG_FUNC_MAPPING[agg_props["function"]]
+
+                target_list.append(
+                    agg_func() if agg_props["column"] == "*" else agg_func(self.table.c[agg_props["column"]])
+                )
+
+            statement = select(*target_list)
+
         clauses = []
         for qual in quals:
             operator = OPERATORS.get(qual.operator, None)
@@ -417,16 +447,20 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                 log_to_postgres("Qual not pushed to foreign db: %s" % qual, WARNING)
         if clauses:
             statement = statement.where(and_(*clauses))
-        if columns:
-            columns = [self.table.c[col] for col in columns]
-        elif columns is None:
-            columns = [self.table]
+
+        if not is_aggregation:
+            if columns:
+                columns = [self.table.c[col] for col in columns]
+            elif columns is None:
+                columns = [self.table]
+            else:
+                # This is the case where we're asked to output no columns (just a list of empty dicts)
+                # in a SELECT 1, but I can't get SQLAlchemy to emit `SELECT 1 FROM some_table`, so
+                # we just select a single column.
+                columns = [self.table.c[list(self.table.c)[0].name]]
+            statement = statement.with_only_columns(columns)
         else:
-            # This is the case where we're asked to output no columns (just a list of empty dicts)
-            # in a SELECT 1, but I can't get SQLAlchemy to emit `SELECT 1 FROM some_table`, so
-            # we just select a single column.
-            columns = [self.table.c[list(self.table.c)[0].name]]
-        statement = statement.with_only_columns(columns)
+            statement = statement.group_by(*[self.table.c[col] for col in group_clauses])
 
         for sortkey in sortkeys:
             column = self.table.c[sortkey.attname]
@@ -440,12 +474,13 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             statement = statement.order_by(column)
         return statement
 
-    def execute(self, quals, columns, sortkeys=None):
+    def execute(self, quals, columns, sortkeys=None, aggs=None, group_clauses=None):
         """
         The quals are turned into an and'ed where clause.
         """
         sortkeys = sortkeys or []
-        statement = self._build_statement(quals, columns, sortkeys)
+        is_aggregation = aggs or group_clauses
+        statement = self._build_statement(quals, columns, sortkeys, aggs=aggs, group_clauses=group_clauses)
         log_to_postgres(str(statement), DEBUG)
 
         # If a dialect doesn't support streaming using server-side cursors,
@@ -453,7 +488,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         offset = 0
         with inject_envvars(self.envvars):
             while True:
-                if self.batch_size is not None:
+                if self.batch_size is not None and not is_aggregation:
                     statement = statement.limit(self.batch_size).offset(offset)
                     offset += self.batch_size
 
@@ -467,9 +502,14 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                     rs = list(rs)
                 returned = 0
                 for item in rs:
-                    yield dict(item)
-                    returned += 1
-                if self.batch_size is None or returned < self.batch_size:
+                    if not is_aggregation:
+                        yield dict(item)
+                        returned += 1
+                    else:
+                        # TODO: parse the response according to Multicorn upperrel format
+                        return None
+
+                if self.batch_size is None or returned < self.batch_size or is_aggregation:
                     return
 
     @property
