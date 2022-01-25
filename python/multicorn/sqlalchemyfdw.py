@@ -427,7 +427,9 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         if not is_aggregation:
             statement = select([self.table])
         else:
-            target_list = [self.table.c[col] for col in group_clauses]
+            target_list = []
+            if group_clauses is not None:
+                target_list = [self.table.c[col] for col in group_clauses]
 
             for agg_name, agg_props in aggs.items():
                 agg_func = _PG_AGG_FUNC_MAPPING[agg_props["function"]]
@@ -458,7 +460,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                 # we just select a single column.
                 columns = [self.table.c[list(self.table.c)[0].name]]
             statement = statement.with_only_columns(columns)
-        else:
+        elif group_clauses is not None:
             statement = statement.group_by(*[self.table.c[col] for col in group_clauses])
 
         for sortkey in sortkeys:
@@ -494,8 +496,6 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                 rs = self.connection.execution_options(stream_results=True).execute(
                     statement
                 )
-
-                logging.error(rs)
 
                 # Workaround pymssql "trash old results on new query"
                 # behaviour (See issue #100)
