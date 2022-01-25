@@ -228,7 +228,7 @@ def _parse_url_from_options(fdw_options):
 _PG_AGG_FUNC_MAPPING = {
     "min": func.min,
     "max": func.max,
-    "sum", func.sum,
+    "sum": func.sum,
     "count": func.count,
     "count.*": func.count
 }
@@ -431,10 +431,9 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
             for agg_name, agg_props in aggs.items():
                 agg_func = _PG_AGG_FUNC_MAPPING[agg_props["function"]]
+                agg_target = agg_func() if agg_props["column"] == "*" else agg_func(self.table.c[agg_props["column"]])
 
-                target_list.append(
-                    agg_func() if agg_props["column"] == "*" else agg_func(self.table.c[agg_props["column"]])
-                )
+                target_list.append(agg_target.label(agg_name))
 
             statement = select(*target_list)
 
@@ -496,18 +495,16 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                     statement
                 )
 
+                logging.error(rs)
+
                 # Workaround pymssql "trash old results on new query"
                 # behaviour (See issue #100)
                 if self.engine.driver == "pymssql" and self.transaction is not None:
                     rs = list(rs)
                 returned = 0
                 for item in rs:
-                    if not is_aggregation:
-                        yield dict(item)
-                        returned += 1
-                    else:
-                        # TODO: parse the response according to Multicorn upperrel format
-                        return None
+                    yield dict(item)
+                    returned += 1
 
                 if self.batch_size is None or returned < self.batch_size or is_aggregation:
                     return
