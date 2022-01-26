@@ -226,6 +226,7 @@ def _parse_url_from_options(fdw_options):
     return url
 
 _PG_AGG_FUNC_MAPPING = {
+    "avg": func.avg,
     "min": func.min,
     "max": func.max,
     "sum": func.sum,
@@ -419,7 +420,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
     def explain(self, quals, columns, sortkeys=None, aggs=None, group_clauses=None, verbose=False):
         sortkeys = sortkeys or []
         statement = self._build_statement(quals, columns, sortkeys, aggs=aggs, group_clauses=group_clauses)
-        return [str(statement)]
+        return ["\n" + str(statement.compile(dialect=self.engine.dialect, compile_kwargs={"literal_binds": True})) + "\n"]
 
     def _build_statement(self, quals, columns, sortkeys, aggs=None, group_clauses=None):
         is_aggregation = aggs or group_clauses
@@ -428,16 +429,18 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             statement = select([self.table])
         else:
             target_list = []
+
             if group_clauses is not None:
                 target_list = [self.table.c[col] for col in group_clauses]
 
-            for agg_name, agg_props in aggs.items():
-                agg_func = _PG_AGG_FUNC_MAPPING[agg_props["function"]]
-                agg_target = agg_func() if agg_props["column"] == "*" else agg_func(self.table.c[agg_props["column"]])
+            if aggs is not None:
+                for agg_name, agg_props in aggs.items():
+                    agg_func = _PG_AGG_FUNC_MAPPING[agg_props["function"]]
+                    agg_target = agg_func() if agg_props["column"] == "*" else agg_func(self.table.c[agg_props["column"]])
 
-                target_list.append(agg_target.label(agg_name))
+                    target_list.append(agg_target.label(agg_name))
 
-            statement = select(*target_list)
+            statement = select(*target_list).select_from(self.table)
 
         clauses = []
         for qual in quals:
@@ -445,7 +448,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
             if operator:
                 clauses.append(operator(self.table.c[qual.field_name], qual.value))
             else:
-                log_to_postgres("Qual not pushed to foreign db: %s" % qual, WARNING)
+                log_to_postgres(f"Qual {qual} with operator {qual.operator} not pushed to foreign db", ERROR if is_aggregation else WARNING)
         if clauses:
             statement = statement.where(and_(*clauses))
 
