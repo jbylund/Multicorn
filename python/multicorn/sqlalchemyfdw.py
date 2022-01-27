@@ -420,6 +420,10 @@ class SqlAlchemyFdw(ForeignDataWrapper):
     def explain(self, quals, columns, sortkeys=None, aggs=None, group_clauses=None, verbose=False):
         sortkeys = sortkeys or []
         statement = self._build_statement(quals, columns, sortkeys, aggs=aggs, group_clauses=group_clauses)
+
+        # The literal_binds option below ensures that qualifiers are displayed as raw strings
+        # instead of being masked by placeholder bound parameters, thus providing more transparency
+        # during use (and testing).
         return ["\n" + str(statement.compile(dialect=self.engine.dialect, compile_kwargs={"literal_binds": True})) + "\n"]
 
     def _build_statement(self, quals, columns, sortkeys, aggs=None, group_clauses=None):
