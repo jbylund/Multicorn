@@ -224,17 +224,13 @@ class ForeignDataWrapper(object):
 
             {
                 "groupby_supported": <true_or_false>, # can be ommited if false
-                "agg_functions": {
-                    <PG_agg_func_name>: <foreign_agg_func_name>,
-                    ...
-                },
+                "agg_functions": ["min", "max", "sum", ...],
                 "supported_operators": [">", "<", "=", ...]
             }
 
-            Each entry in `agg_functions` dict corresponds to a maping between
-            the name of a aggregation function in PostgreSQL, and the equivalent
-            foreign function. If no mapping exists for an aggregate function any
-            queries containing it won't be pushed down.
+            Each entry in `agg_functions` list corresponds to the name of a
+            aggregation function in PostgreSQL, which the FDW can pushdown.
+            If a query has a function not in this list it won't be pushed down.
 
             The `supported_operators` entry lists all operators that can be used
             in qual (WHERE) clauses so that the aggregation pushdown will still

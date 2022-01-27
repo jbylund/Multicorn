@@ -1771,14 +1771,9 @@ canPushdownUpperrel(MulticornPlanState * state)
         Py_XDECREF(p_object);
 
         /* Determine which aggregation functions are supported */
-        p_object = PyMapping_GetItemString(p_upperrel_pushdown, "agg_functions");
-        if (p_object != NULL && p_object != Py_None)
-		{
-            p_agg_funcs = PyMapping_Keys(p_object);
-            pythonUnicodeSequenceToList(p_agg_funcs, &state->agg_functions);
-            Py_DECREF(p_agg_funcs);
-		}
-        Py_XDECREF(p_object);
+        p_agg_funcs = PyMapping_GetItemString(p_upperrel_pushdown, "agg_functions");
+        pythonUnicodeSequenceToList(p_agg_funcs, &state->agg_functions);
+        Py_XDECREF(p_agg_funcs);
 
         /* Construct supported qual operators list */
         p_ops = PyMapping_GetItemString(p_upperrel_pushdown, "operators_supported");
