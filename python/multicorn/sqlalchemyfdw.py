@@ -492,7 +492,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         offset = 0
         with inject_envvars(self.envvars):
             while True:
-                if self.batch_size is not None and not is_aggregation:
+                if self.batch_size is not None:
                     statement = statement.limit(self.batch_size).offset(offset)
                     offset += self.batch_size
 
@@ -509,7 +509,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
                     yield dict(item)
                     returned += 1
 
-                if self.batch_size is None or returned < self.batch_size or is_aggregation:
+                if self.batch_size is None or returned < self.batch_size:
                     return
 
     @property
