@@ -1763,12 +1763,15 @@ canPushdownUpperrel(MulticornPlanState * state)
     if (p_upperrel_pushdown != NULL && p_upperrel_pushdown != Py_None)
     {
         /* Determine whether the FDW instance supports GROUP BYs */
-        p_object = PyMapping_GetItemString(p_upperrel_pushdown, "groupby_supported");
-        if (p_object != NULL && p_object != Py_None)
-		{
-            state->groupby_supported = PyObject_IsTrue(p_object);
-		}
-        Py_XDECREF(p_object);
+        if (PyMapping_HasKeyString(p_upperrel_pushdown, "groupby_supported"))
+        {
+            p_object = PyMapping_GetItemString(p_upperrel_pushdown, "groupby_supported");
+            if (p_object != NULL && p_object != Py_None)
+            {
+                state->groupby_supported = PyObject_IsTrue(p_object);
+            }
+            Py_XDECREF(p_object);
+        }
 
         /* Determine which aggregation functions are supported */
         p_agg_funcs = PyMapping_GetItemString(p_upperrel_pushdown, "agg_functions");
