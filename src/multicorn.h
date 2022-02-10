@@ -121,6 +121,7 @@ typedef struct MulticornPlanState
 
 	/* qual clauses */
 	List	   *baserestrictinfo;
+    Value *rtindex;
 
     /* Actual remote restriction clauses for scan (sans RestrictInfos) */
 	List	   *final_remote_exprs;
@@ -197,6 +198,7 @@ typedef struct MulticornExecState
      * Qual conditions parsed in the MulticornGetForeignRelSize
      */
     List *baserestrictinfo;
+    Value *rtindex;
 
 	/* Common buffer to avoid repeated allocations */
 	StringInfo	buffer;
