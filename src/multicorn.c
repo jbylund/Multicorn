@@ -590,6 +590,16 @@ multicornGetForeignPlan(PlannerInfo *root,
          */
         ofpinfo = (MulticornPlanState *) planstate->outerrel->fdw_private;
         planstate->baserestrictinfo = extract_actual_clauses(ofpinfo->baserestrictinfo, false);
+
+        /*
+         * In case of a join or aggregate use the lowest-numbered member RTE out
+         * of all all the base relations participating in the underlying scan.
+         *
+         * NB: This may not work well in case of joins, keep an eye out for it.
+         * We extract it here because fs_relids in execution phase can get distorted
+         * in case of joins + agg combos.
+         */
+        planstate->rtindex = makeInteger(bms_next_member(root->all_baserels, -1));
     }
 
 	return make_foreignscan(tlist,
@@ -640,7 +650,7 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 	ForeignScan *fscan = (ForeignScan *) node->ss.ps.plan;
 	MulticornExecState *execstate;
 	ListCell   *lc;
-    int			rtindex;
+    int rtindex;
     List *clauses;
 
     execstate = initializeExecState(fscan->fdw_private);
@@ -677,12 +687,8 @@ multicornBeginForeignScan(ForeignScanState *node, int eflags)
 #endif
         initConversioninfo(execstate->cinfos, TupleDescGetAttInMetadata(execstate->tupdesc), execstate->upper_rel_targets);
 
-        /*
-         * In case of a join or aggregate use the lowest-numbered member RTE out
-         * of all all the base relations participating in the underlying scan.
-         * NB: This may not work well in case of joins, keep an eye out for it.
-         */
-        rtindex = bms_next_member(fscan->fs_relids, -1);
+        // Needed for parsing quals
+        rtindex = intVal(execstate->rtindex);
         clauses = execstate->baserestrictinfo;
 	}
 
@@ -2016,6 +2022,8 @@ serializePlanState(MulticornPlanState * state)
 
     result = lappend(result, state->baserestrictinfo);
 
+    result = lappend(result, state->rtindex);
+
 	return result;
 }
 
@@ -2058,5 +2066,6 @@ initializeExecState(void *internalstate)
     execstate->aggs = list_nth(values, 5);
     execstate->group_clauses = list_nth(values, 6);
     execstate->baserestrictinfo = list_nth(values, 7);
+    execstate->rtindex = list_nth(values, 8);
 	return execstate;
 }
