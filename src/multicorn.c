@@ -1689,6 +1689,18 @@ multicorn_foreign_grouping_ok(PlannerInfo *root, RelOptInfo *grouped_rel,
 	/* Get the fpinfo of the underlying scan relation. */
 	ofpinfo = (MulticornPlanState *) fpinfo->outerrel->fdw_private;
 
+    /*
+	 * If underlying scan relation has more quals than we are attempting to push
+     * down, this means that some are missing in qual_list, hence the aggregation
+     * wouldn't be correct. Examples includes using a float value in a WHERE clause
+     * against a column of integer type.
+     * NB: If we ever decide to add support for join-agg pushdown this won't work.
+	 */
+    if (list_length(ofpinfo->qual_list) < list_length(fpinfo->outerrel->baserestrictinfo))
+    {
+        return false;
+    }
+
 	/*
 	 * If underlying scan relation has any quals with unsupported operators
      * we cannot pushdown the aggregation.
