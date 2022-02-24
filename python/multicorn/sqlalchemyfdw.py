@@ -362,7 +362,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
         self.engine = _create_engine(url, self.connect_args)
 
-        self.cast_quals = fdw_options.get("cast_quals", "no") == "yes"
+        self.cast_quals = fdw_options.get("cast_quals", "false") == "true"
 
         schema = fdw_options["schema"] if "schema" in fdw_options else None
         tablename = fdw_options["tablename"]
