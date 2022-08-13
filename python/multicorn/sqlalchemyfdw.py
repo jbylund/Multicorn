@@ -156,7 +156,7 @@ import os
 from contextlib import contextmanager
 from typing import Optional
 
-from sqlalchemy import create_engine
+from sqlalchemy import cast, create_engine, literal
 from sqlalchemy.engine.url import make_url, URL
 from sqlalchemy.exc import UnsupportedCompilationError
 from sqlalchemy.sql import select, operators as sqlops, func, and_
@@ -362,6 +362,8 @@ class SqlAlchemyFdw(ForeignDataWrapper):
 
         self.engine = _create_engine(url, self.connect_args)
 
+        self.cast_quals = fdw_options.get("cast_quals", "false") == "true"
+
         schema = fdw_options["schema"] if "schema" in fdw_options else None
         tablename = fdw_options["tablename"]
         sqlacols = []
@@ -378,7 +380,7 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         self._connection = None
         self._row_id_column = fdw_options.get("primary_key", None)
 
-        self.batch_size = int(fdw_options.get("batch_size", 10000))
+        self.batch_size = int(fdw_options["batch_size"]) if "batch_size" in fdw_options else None
         self.envvars = json.loads(fdw_options.get("envvars", "{}"))
 
     def _need_explicit_null_ordering(self, key):
@@ -450,7 +452,10 @@ class SqlAlchemyFdw(ForeignDataWrapper):
         for qual in quals:
             operator = OPERATORS.get(qual.operator, None)
             if operator:
-                clauses.append(operator(self.table.c[qual.field_name], qual.value))
+                value = qual.value if not self.cast_quals \
+                    else cast(literal(qual.value), self.table.c[qual.field_name].type.as_generic())
+
+                clauses.append(operator(self.table.c[qual.field_name], value))
             else:
                 log_to_postgres(f"Qual {qual} with operator {qual.operator} not pushed to foreign db", ERROR if is_aggregation else WARNING)
         if clauses:
